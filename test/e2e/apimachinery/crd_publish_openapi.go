@@ -27,9 +27,11 @@ import (
 	"time"
 
 	"github.com/onsi/ginkgo/v2"
-	openapiutil "k8s.io/kube-openapi/pkg/util"
-	"k8s.io/utils/pointer"
 	"sigs.k8s.io/yaml"
+
+	"k8s.io/apiserver/pkg/cel/environment"
+	openapiutil "k8s.io/kube-openapi/pkg/util"
+	"k8s.io/utils/ptr"
 
 	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
@@ -53,7 +55,7 @@ var (
 
 var _ = SIGDescribe("CustomResourcePublishOpenAPI [Privileged:ClusterAdmin]", func() {
 	f := framework.NewDefaultFramework("crd-publish-openapi")
-	f.NamespacePodSecurityEnforceLevel = admissionapi.LevelPrivileged
+	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
 
 	/*
 		Release: v1.16
@@ -479,7 +481,7 @@ var _ = SIGDescribe("CustomResourcePublishOpenAPI [Privileged:ClusterAdmin]", fu
 	})
 
 	// Marked as flaky until https://github.com/kubernetes/kubernetes/issues/65517 is solved.
-	ginkgo.It("[Flaky] kubectl explain works for CR with the same resource name as built-in object.", func(ctx context.Context) {
+	f.It(f.WithFlaky(), "kubectl explain works for CR with the same resource name as built-in object.", func(ctx context.Context) {
 		customServiceShortName := fmt.Sprintf("ksvc-%d", time.Now().Unix()) // make short name unique
 		opt := func(crd *apiextensionsv1.CustomResourceDefinition) {
 			crd.ObjectMeta = metav1.ObjectMeta{Name: "services." + crd.Spec.Group}
@@ -550,7 +552,7 @@ func setupCRDAndVerifySchemaWithOptions(f *framework.Framework, schema, expect [
 			} else {
 				version.Schema = &apiextensionsv1.CustomResourceValidation{
 					OpenAPIV3Schema: &apiextensionsv1.JSONSchemaProps{
-						XPreserveUnknownFields: pointer.BoolPtr(true),
+						XPreserveUnknownFields: ptr.To(true),
 						Type:                   "object",
 					},
 				}
@@ -697,7 +699,8 @@ func convertJSONSchemaProps(in []byte, out *spec.Schema) error {
 		return err
 	}
 	kubeOut := spec.Schema{}
-	if err := validation.ConvertJSONSchemaPropsWithPostProcess(&internal, &kubeOut, validation.StripUnsupportedFormatsPostProcess); err != nil {
+	formatPostProcessor := validation.StripUnsupportedFormatsPostProcessorForVersion(environment.DefaultCompatibilityVersion())
+	if err := validation.ConvertJSONSchemaPropsWithPostProcess(&internal, &kubeOut, formatPostProcessor); err != nil {
 		return err
 	}
 	bs, err := json.Marshal(kubeOut)
@@ -713,6 +716,7 @@ func dropDefaults(s *spec.Schema) {
 	delete(s.Properties, "apiVersion")
 	delete(s.Properties, "kind")
 	delete(s.Extensions, "x-kubernetes-group-version-kind")
+	delete(s.Extensions, "x-kubernetes-selectable-fields")
 }
 
 func verifyKubectlExplain(ns, name, pattern string) error {

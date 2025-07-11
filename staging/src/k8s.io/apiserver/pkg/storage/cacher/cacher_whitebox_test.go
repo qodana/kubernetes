@@ -24,60 +24,54 @@ import (
 	"reflect"
 	goruntime "runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/metadata"
+	"k8s.io/apimachinery/pkg/apis/meta/internalversion"
+	"k8s.io/apimachinery/pkg/apis/meta/internalversion/validation"
 
-	"k8s.io/apimachinery/pkg/api/apitesting"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/runtime/serializer"
-	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/version"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/apiserver/pkg/apis/example"
 	examplev1 "k8s.io/apiserver/pkg/apis/example/v1"
-	example2v1 "k8s.io/apiserver/pkg/apis/example2/v1"
 	"k8s.io/apiserver/pkg/features"
 	"k8s.io/apiserver/pkg/storage"
-	"k8s.io/apiserver/pkg/storage/etcd3"
+	"k8s.io/apiserver/pkg/storage/cacher/delegator"
+	"k8s.io/apiserver/pkg/storage/cacher/metrics"
 	etcd3testing "k8s.io/apiserver/pkg/storage/etcd3/testing"
-	"k8s.io/apiserver/pkg/storage/value/encrypt/identity"
+	etcdfeature "k8s.io/apiserver/pkg/storage/feature"
+	storagetesting "k8s.io/apiserver/pkg/storage/testing"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	utilflowcontrol "k8s.io/apiserver/pkg/util/flowcontrol"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	k8smetrics "k8s.io/component-base/metrics"
+	"k8s.io/component-base/metrics/testutil"
 	"k8s.io/utils/clock"
-	"k8s.io/utils/pointer"
+	testingclock "k8s.io/utils/clock/testing"
+	"k8s.io/utils/ptr"
 )
 
-var (
-	scheme   = runtime.NewScheme()
-	codecs   = serializer.NewCodecFactory(scheme)
-	errDummy = fmt.Errorf("dummy error")
-)
-
-func init() {
-	metav1.AddToGroupVersion(scheme, metav1.SchemeGroupVersion)
-	utilruntime.Must(example.AddToScheme(scheme))
-	utilruntime.Must(examplev1.AddToScheme(scheme))
-	utilruntime.Must(example2v1.AddToScheme(scheme))
-}
-
-func newTestCacher(s storage.Interface) (*Cacher, storage.Versioner, error) {
+func newTestCacherWithoutSyncing(s storage.Interface, c clock.WithTicker) (*Cacher, storage.Versioner, error) {
 	prefix := "pods"
 	config := Config{
-		Storage:        s,
-		Versioner:      storage.APIObjectVersioner{},
-		GroupResource:  schema.GroupResource{Resource: "pods"},
-		ResourcePrefix: prefix,
-		KeyFunc:        func(obj runtime.Object) (string, error) { return storage.NamespaceKeyFunc(prefix, obj) },
+		Storage:             s,
+		Versioner:           storage.APIObjectVersioner{},
+		GroupResource:       schema.GroupResource{Resource: "pods"},
+		EventsHistoryWindow: DefaultEventFreshDuration,
+		ResourcePrefix:      prefix,
+		KeyFunc:             func(obj runtime.Object) (string, error) { return storage.NamespaceKeyFunc(prefix, obj) },
 		GetAttrsFunc: func(obj runtime.Object) (labels.Set, fields.Set, error) {
 			pod, ok := obj.(*example.Pod)
 			if !ok {
@@ -93,17 +87,54 @@ func newTestCacher(s storage.Interface) (*Cacher, storage.Versioner, error) {
 		NewFunc:     func() runtime.Object { return &example.Pod{} },
 		NewListFunc: func() runtime.Object { return &example.PodList{} },
 		Codec:       codecs.LegacyCodec(examplev1.SchemeGroupVersion),
-		Clock:       clock.RealClock{},
+		Clock:       c,
 	}
 	cacher, err := NewCacherFromConfig(config)
+
 	return cacher, storage.APIObjectVersioner{}, err
+}
+
+func newTestCacher(s storage.Interface) (*Cacher, storage.Versioner, error) {
+	cacher, versioner, err := newTestCacherWithoutSyncing(s, clock.RealClock{})
+	if err != nil {
+		return nil, versioner, err
+	}
+
+	if utilfeature.DefaultFeatureGate.Enabled(features.ResilientWatchCacheInitialization) {
+		// The tests assume that Get/GetList/Watch calls shouldn't fail.
+		// However, 429 error can now be returned if watchcache is under initialization.
+		// To avoid rewriting all tests, we wait for watcache to initialize.
+		if err := cacher.Wait(context.Background()); err != nil {
+			return nil, storage.APIObjectVersioner{}, err
+		}
+	}
+	return cacher, versioner, nil
 }
 
 type dummyStorage struct {
 	sync.RWMutex
-	err       error
-	getListFn func(_ context.Context, _ string, _ storage.ListOptions, listObj runtime.Object) error
-	watchFn   func(_ context.Context, _ string, _ storage.ListOptions) (watch.Interface, error)
+	getlistErr error
+	watchErr   error
+	getListFn  func(_ context.Context, _ string, _ storage.ListOptions, listObj runtime.Object) error
+	getRVFn    func(_ context.Context) (uint64, error)
+	watchFn    func(_ context.Context, _ string, _ storage.ListOptions) (watch.Interface, error)
+
+	// use getRequestWatchProgressCounter when reading
+	// the value of the counter
+	requestWatchProgressCounter int
+}
+
+func (d *dummyStorage) RequestWatchProgress(ctx context.Context) error {
+	d.Lock()
+	defer d.Unlock()
+	d.requestWatchProgressCounter++
+	return nil
+}
+
+func (d *dummyStorage) getRequestWatchProgressCounter() int {
+	d.RLock()
+	defer d.RUnlock()
+	return d.requestWatchProgressCounter
 }
 
 type dummyWatch struct {
@@ -128,7 +159,7 @@ func (d *dummyStorage) Versioner() storage.Versioner { return nil }
 func (d *dummyStorage) Create(_ context.Context, _ string, _, _ runtime.Object, _ uint64) error {
 	return fmt.Errorf("unimplemented")
 }
-func (d *dummyStorage) Delete(_ context.Context, _ string, _ runtime.Object, _ *storage.Preconditions, _ storage.ValidateObjectFunc, _ runtime.Object) error {
+func (d *dummyStorage) Delete(_ context.Context, _ string, _ runtime.Object, _ *storage.Preconditions, _ storage.ValidateObjectFunc, _ runtime.Object, _ storage.DeleteOptions) error {
 	return fmt.Errorf("unimplemented")
 }
 func (d *dummyStorage) Watch(ctx context.Context, key string, opts storage.ListOptions) (watch.Interface, error) {
@@ -138,13 +169,12 @@ func (d *dummyStorage) Watch(ctx context.Context, key string, opts storage.ListO
 	d.RLock()
 	defer d.RUnlock()
 
-	return newDummyWatch(), d.err
+	return newDummyWatch(), d.watchErr
 }
 func (d *dummyStorage) Get(_ context.Context, _ string, _ storage.GetOptions, _ runtime.Object) error {
 	d.RLock()
 	defer d.RUnlock()
-
-	return d.err
+	return d.getlistErr
 }
 func (d *dummyStorage) GetList(ctx context.Context, resPrefix string, opts storage.ListOptions, listObj runtime.Object) error {
 	if d.getListFn != nil {
@@ -154,81 +184,569 @@ func (d *dummyStorage) GetList(ctx context.Context, resPrefix string, opts stora
 	defer d.RUnlock()
 	podList := listObj.(*example.PodList)
 	podList.ListMeta = metav1.ListMeta{ResourceVersion: "100"}
-	return d.err
+	return d.getlistErr
 }
 func (d *dummyStorage) GuaranteedUpdate(_ context.Context, _ string, _ runtime.Object, _ bool, _ *storage.Preconditions, _ storage.UpdateFunc, _ runtime.Object) error {
 	return fmt.Errorf("unimplemented")
 }
-func (d *dummyStorage) Count(_ string) (int64, error) {
-	return 0, fmt.Errorf("unimplemented")
+func (d *dummyStorage) Stats(_ context.Context) (storage.Stats, error) {
+	return storage.Stats{}, fmt.Errorf("unimplemented")
 }
-func (d *dummyStorage) injectError(err error) {
+func (d *dummyStorage) SetKeysFunc(storage.KeysFunc) {
+}
+func (d *dummyStorage) ReadinessCheck() error {
+	return nil
+}
+func (d *dummyStorage) injectGetListError(err error) {
 	d.Lock()
 	defer d.Unlock()
 
-	d.err = err
+	d.getlistErr = err
 }
 
-func TestGetListCacheBypass(t *testing.T) {
-	backingStorage := &dummyStorage{}
-	cacher, _, err := newTestCacher(backingStorage)
+func (d *dummyStorage) GetCurrentResourceVersion(ctx context.Context) (uint64, error) {
+	if d.getRVFn != nil {
+		return d.getRVFn(ctx)
+	}
+	return 100, nil
+}
+
+type dummyCacher struct {
+	dummyStorage
+	ready bool
+}
+
+func (d *dummyCacher) Ready() bool {
+	return d.ready
+}
+
+func TestShouldDelegateList(t *testing.T) {
+	type opts struct {
+		Recursive            bool
+		ResourceVersion      string
+		ResourceVersionMatch metav1.ResourceVersionMatch
+		Limit                int64
+		Continue             string
+	}
+	toInternalOpts := func(opt opts) *internalversion.ListOptions {
+		return &internalversion.ListOptions{
+			ResourceVersion:      opt.ResourceVersion,
+			ResourceVersionMatch: opt.ResourceVersionMatch,
+			Limit:                opt.Limit,
+			Continue:             opt.Continue,
+		}
+	}
+
+	toStorageOpts := func(opt opts) storage.ListOptions {
+		return storage.ListOptions{
+			Recursive:            opt.Recursive,
+			ResourceVersion:      opt.ResourceVersion,
+			ResourceVersionMatch: opt.ResourceVersionMatch,
+			Predicate: storage.SelectionPredicate{
+				Continue: opt.Continue,
+				Limit:    opt.Limit,
+			},
+		}
+	}
+	oldRV := "80"
+	cacheRV := "100"
+	etcdRV := "120"
+
+	keyPrefix := "/pods/"
+	continueOnOldRV, err := storage.EncodeContinue(keyPrefix+"foo", keyPrefix, int64(mustAtoi(oldRV)))
 	if err != nil {
-		t.Fatalf("Couldn't create cacher: %v", err)
+		t.Fatalf("Unexpected error: %v", err)
 	}
-	defer cacher.Stop()
-
-	pred := storage.SelectionPredicate{
-		Limit: 500,
-	}
-	result := &example.PodList{}
-
-	// Wait until cacher is initialized.
-	if err := cacher.ready.wait(context.Background()); err != nil {
-		t.Fatalf("unexpected error waiting for the cache to be ready")
-	}
-
-	// Inject error to underlying layer and check if cacher is not bypassed.
-	backingStorage.injectError(errDummy)
-	err = cacher.GetList(context.TODO(), "pods/ns", storage.ListOptions{
-		ResourceVersion: "0",
-		Predicate:       pred,
-		Recursive:       true,
-	}, result)
+	continueOnCacheRV, err := storage.EncodeContinue(keyPrefix+"foo", keyPrefix, int64(mustAtoi(cacheRV)))
 	if err != nil {
-		t.Errorf("GetList with Limit and RV=0 should be served from cache: %v", err)
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	// Continue from different apiserver that is forward in RVs
+	continueOnEtcdRV, err := storage.EncodeContinue(keyPrefix+"foo", keyPrefix, int64(mustAtoi(etcdRV)))
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
 	}
 
-	err = cacher.GetList(context.TODO(), "pods/ns", storage.ListOptions{
-		ResourceVersion: "",
-		Predicate:       pred,
-		Recursive:       true,
-	}, result)
-	if err != errDummy {
-		t.Errorf("GetList with Limit without RV=0 should bypass cacher: %v", err)
+	continueOnNegativeRV, err := storage.EncodeContinue(keyPrefix+"foo", keyPrefix, -1)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	testCases := map[opts]bool{}
+	testCases[opts{}] = true
+	testCases[opts{Limit: 100}] = true
+	testCases[opts{ResourceVersion: "0"}] = false
+	testCases[opts{ResourceVersion: "0", Limit: 100}] = false
+	testCases[opts{ResourceVersion: "0", ResourceVersionMatch: metav1.ResourceVersionMatchNotOlderThan}] = false
+	testCases[opts{ResourceVersion: "0", ResourceVersionMatch: metav1.ResourceVersionMatchNotOlderThan, Limit: 100}] = false
+	// Continue
+	for _, continueToken := range []string{continueOnOldRV, continueOnCacheRV, continueOnEtcdRV, continueOnNegativeRV} {
+		testCases[opts{Continue: continueToken}] = true
+		testCases[opts{Limit: 100, Continue: continueToken}] = true
+		testCases[opts{ResourceVersion: "0", Continue: continueToken}] = true
+		testCases[opts{ResourceVersion: "0", Limit: 100, Continue: continueToken}] = true
+	}
+	// With RV
+	for _, rv := range []string{oldRV, cacheRV, etcdRV} {
+		testCases[opts{ResourceVersion: rv}] = false
+		testCases[opts{ResourceVersion: rv, Limit: 100}] = true
+		testCases[opts{ResourceVersion: rv, ResourceVersionMatch: metav1.ResourceVersionMatchExact}] = true
+		testCases[opts{ResourceVersion: rv, ResourceVersionMatch: metav1.ResourceVersionMatchExact, Limit: 100}] = true
+		testCases[opts{ResourceVersion: rv, ResourceVersionMatch: metav1.ResourceVersionMatchNotOlderThan}] = false
+		testCases[opts{ResourceVersion: rv, ResourceVersionMatch: metav1.ResourceVersionMatchNotOlderThan, Limit: 100}] = false
+	}
+
+	// Bypass for most requests doesn't depend on Recursive
+	for opts, expectBypass := range testCases {
+		opts.Recursive = true
+		testCases[opts] = expectBypass
+	}
+	// Continue is ignored on non recursive LIST
+	for _, rv := range []string{oldRV, etcdRV} {
+		for _, continueToken := range []string{continueOnOldRV, continueOnCacheRV, continueOnEtcdRV, continueOnNegativeRV} {
+			testCases[opts{ResourceVersion: rv, Continue: continueToken}] = true
+			testCases[opts{ResourceVersion: rv, Continue: continueToken, Limit: 100}] = true
+		}
+	}
+
+	for _, rv := range []string{"", "0", oldRV, etcdRV} {
+		for _, match := range []metav1.ResourceVersionMatch{"", metav1.ResourceVersionMatchExact, metav1.ResourceVersionMatchNotOlderThan} {
+			for _, continueKey := range []string{"", continueOnOldRV, continueOnCacheRV, continueOnEtcdRV, continueOnNegativeRV} {
+				for _, limit := range []int64{0, 100} {
+					for _, recursive := range []bool{true, false} {
+						opt := opts{
+							Recursive:            recursive,
+							ResourceVersion:      rv,
+							ResourceVersionMatch: match,
+							Limit:                limit,
+							Continue:             continueKey,
+						}
+						if errs := validation.ValidateListOptions(toInternalOpts(opt), false); len(errs) != 0 {
+							continue
+						}
+						if _, _, err = storage.ValidateListOptions(keyPrefix, storage.APIObjectVersioner{}, toStorageOpts(opt)); err != nil {
+							continue
+						}
+						_, found := testCases[opt]
+						if !found {
+							t.Errorf("Test case not covered, but passes validation: %+v", opt)
+						}
+					}
+
+				}
+			}
+		}
+	}
+
+	for opt := range testCases {
+		if errs := validation.ValidateListOptions(toInternalOpts(opt), false); len(errs) != 0 {
+			t.Errorf("Invalid LIST request that should not be tested %+v", opt)
+			continue
+		}
+		if _, _, err = storage.ValidateListOptions(keyPrefix, storage.APIObjectVersioner{}, toStorageOpts(opt)); err != nil {
+			t.Errorf("Invalid LIST request that should not be tested %+v", opt)
+			continue
+		}
+	}
+
+	runTestCases := func(t *testing.T, snapshotAvailable bool, testcases map[opts]bool, overrides ...map[opts]bool) {
+		for opt, expectBypass := range testCases {
+			for _, override := range overrides {
+				if bypass, ok := override[opt]; ok {
+					expectBypass = bypass
+				}
+			}
+			backingStorage := &dummyStorage{}
+			backingStorage.getListFn = func(_ context.Context, _ string, _ storage.ListOptions, listObj runtime.Object) error {
+				podList := listObj.(*example.PodList)
+				podList.ListMeta = metav1.ListMeta{ResourceVersion: cacheRV}
+				return nil
+			}
+			cacher, _, err := newTestCacher(backingStorage)
+			if err != nil {
+				t.Fatalf("Couldn't create cacher: %v", err)
+			}
+			defer cacher.Stop()
+			if snapshotAvailable {
+				cacher.watchCache.snapshots.Add(uint64(mustAtoi(oldRV)), fakeOrderedLister{})
+			}
+			result, err := delegator.ShouldDelegateList(toStorageOpts(opt), cacher)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.ShouldDelegate != expectBypass {
+				t.Errorf("Unexpected bypass result for List request with options %+v, bypass expected: %v, got: %v", opt, expectBypass, result.ShouldDelegate)
+			}
+		}
+	}
+
+	// Exacts and continue on current cache RV.
+	listFromSnapshotEnabledOverrides := map[opts]bool{}
+	listFromSnapshotEnabledOverrides[opts{Recursive: true, ResourceVersion: cacheRV, Limit: 100}] = false
+	listFromSnapshotEnabledOverrides[opts{Recursive: true, ResourceVersion: cacheRV, ResourceVersionMatch: metav1.ResourceVersionMatchExact}] = false
+	listFromSnapshotEnabledOverrides[opts{Recursive: true, ResourceVersion: cacheRV, Limit: 100, ResourceVersionMatch: metav1.ResourceVersionMatchExact}] = false
+	listFromSnapshotEnabledOverrides[opts{Recursive: true, ResourceVersion: "0", Limit: 100, Continue: continueOnCacheRV}] = false
+	listFromSnapshotEnabledOverrides[opts{Recursive: true, ResourceVersion: "0", Continue: continueOnCacheRV}] = false
+	listFromSnapshotEnabledOverrides[opts{Recursive: true, Limit: 100, Continue: continueOnCacheRV}] = false
+	listFromSnapshotEnabledOverrides[opts{Recursive: true, Continue: continueOnCacheRV}] = false
+
+	// Exacts and continue RV with a snapshot.
+	snapshotAvailableOverrides := map[opts]bool{}
+	snapshotAvailableOverrides[opts{Recursive: true, Continue: continueOnOldRV}] = false
+	snapshotAvailableOverrides[opts{Recursive: true, Limit: 100, Continue: continueOnOldRV}] = false
+	snapshotAvailableOverrides[opts{Recursive: true, ResourceVersion: "0", Continue: continueOnOldRV}] = false
+	snapshotAvailableOverrides[opts{Recursive: true, ResourceVersion: "0", Limit: 100, Continue: continueOnOldRV}] = false
+	snapshotAvailableOverrides[opts{Recursive: true, ResourceVersion: oldRV, Limit: 100}] = false
+	snapshotAvailableOverrides[opts{Recursive: true, ResourceVersion: oldRV, ResourceVersionMatch: metav1.ResourceVersionMatchExact}] = false
+	snapshotAvailableOverrides[opts{Recursive: true, ResourceVersion: oldRV, ResourceVersionMatch: metav1.ResourceVersionMatchExact, Limit: 100}] = false
+
+	t.Run("ConsistentListFromCache=false", func(t *testing.T) {
+		featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ConsistentListFromCache, false)
+		t.Run("ListFromCacheSnapshot=false", func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ListFromCacheSnapshot, false)
+			runTestCases(t, false, testCases)
+		})
+
+		t.Run("ListFromCacheSnapshot=true", func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ListFromCacheSnapshot, true)
+			t.Run("SnapshotAvailable=false", func(t *testing.T) {
+				runTestCases(t, false, testCases, listFromSnapshotEnabledOverrides)
+			})
+			t.Run("SnapshotAvailable=true", func(t *testing.T) {
+				runTestCases(t, true, testCases, listFromSnapshotEnabledOverrides, snapshotAvailableOverrides)
+			})
+		})
+	})
+	t.Run("ConsistentListFromCache=true", func(t *testing.T) {
+		featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ConsistentListFromCache, true)
+		// TODO(p0lyn0mial): the following tests assume that etcdfeature.DefaultFeatureSupportChecker.Supports(storage.RequestWatchProgress)
+		// evaluates to true. Otherwise the cache will be bypassed and the test will fail.
+		//
+		// If you were to run only TestGetListCacheBypass you would see that the test fail.
+		// However in CI all test are run and there must be a test(s) that properly
+		// initialize the storage layer so that the mentioned method evaluates to true
+		forceRequestWatchProgressSupport(t)
+
+		consistentListFromCacheOverrides := map[opts]bool{}
+		for _, recursive := range []bool{true, false} {
+			consistentListFromCacheOverrides[opts{Recursive: recursive}] = false
+			consistentListFromCacheOverrides[opts{Limit: 100, Recursive: recursive}] = false
+		}
+
+		t.Run("ListFromCacheSnapshot=false", func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ListFromCacheSnapshot, false)
+			runTestCases(t, false, testCases, consistentListFromCacheOverrides)
+		})
+		t.Run("ListFromCacheSnapshot=true", func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ListFromCacheSnapshot, true)
+
+			consistentReadWithSnapshotOverrides := map[opts]bool{}
+			// Continues with negative RV are same as consistent read.
+			consistentReadWithSnapshotOverrides[opts{Recursive: true, Limit: 0, Continue: continueOnNegativeRV}] = false
+			consistentReadWithSnapshotOverrides[opts{Recursive: true, Limit: 100, Continue: continueOnNegativeRV}] = false
+			consistentReadWithSnapshotOverrides[opts{Recursive: true, ResourceVersion: "0", Limit: 0, Continue: continueOnNegativeRV}] = false
+			consistentReadWithSnapshotOverrides[opts{Recursive: true, ResourceVersion: "0", Limit: 100, Continue: continueOnNegativeRV}] = false
+			// Exact on RV not yet observed by cache
+			consistentReadWithSnapshotOverrides[opts{Recursive: true, ResourceVersion: etcdRV, Limit: 100}] = false
+			consistentReadWithSnapshotOverrides[opts{Recursive: true, ResourceVersion: etcdRV, ResourceVersionMatch: metav1.ResourceVersionMatchExact}] = false
+			consistentReadWithSnapshotOverrides[opts{Recursive: true, ResourceVersion: etcdRV, ResourceVersionMatch: metav1.ResourceVersionMatchExact, Limit: 100}] = false
+			consistentReadWithSnapshotOverrides[opts{Recursive: true, Continue: continueOnEtcdRV}] = false
+			consistentReadWithSnapshotOverrides[opts{Recursive: true, ResourceVersion: "0", Continue: continueOnEtcdRV}] = false
+			consistentReadWithSnapshotOverrides[opts{Recursive: true, Continue: continueOnEtcdRV, Limit: 100}] = false
+			consistentReadWithSnapshotOverrides[opts{Recursive: true, ResourceVersion: "0", Continue: continueOnEtcdRV, Limit: 100}] = false
+			t.Run("SnapshotAvailable=false", func(t *testing.T) {
+				runTestCases(t, false, testCases, listFromSnapshotEnabledOverrides, consistentListFromCacheOverrides, consistentReadWithSnapshotOverrides)
+			})
+			t.Run("SnapshotAvailable=true", func(t *testing.T) {
+				runTestCases(t, true, testCases, listFromSnapshotEnabledOverrides, consistentListFromCacheOverrides, consistentReadWithSnapshotOverrides, snapshotAvailableOverrides)
+			})
+		})
+	})
+}
+
+func mustAtoi(s string) int {
+	value, err := strconv.Atoi(s)
+	if err != nil {
+		panic(err)
+	}
+	return value
+}
+
+func TestConsistentReadFallback(t *testing.T) {
+	tcs := []struct {
+		name                   string
+		consistentReadsEnabled bool
+		watchCacheRV           string
+		storageRV              string
+		fallbackError          bool
+
+		expectError             bool
+		expectRV                string
+		expectBlock             bool
+		expectRequestsToStorage int
+		expectMetric            string
+	}{
+		{
+			name:                    "Success",
+			consistentReadsEnabled:  true,
+			watchCacheRV:            "42",
+			storageRV:               "42",
+			expectRV:                "42",
+			expectRequestsToStorage: 1,
+			expectMetric: `
+# HELP apiserver_watch_cache_consistent_read_total [ALPHA] Counter for consistent reads from cache.
+# TYPE apiserver_watch_cache_consistent_read_total counter
+apiserver_watch_cache_consistent_read_total{fallback="false", group="", resource="pods", success="true"} 1
+`,
+		},
+		{
+			name:                    "Fallback",
+			consistentReadsEnabled:  true,
+			watchCacheRV:            "2",
+			storageRV:               "42",
+			expectRV:                "42",
+			expectBlock:             true,
+			expectRequestsToStorage: 2,
+			expectMetric: `
+# HELP apiserver_watch_cache_consistent_read_total [ALPHA] Counter for consistent reads from cache.
+# TYPE apiserver_watch_cache_consistent_read_total counter
+apiserver_watch_cache_consistent_read_total{fallback="true", group="", resource="pods", success="true"} 1
+`,
+		},
+		{
+			name:                    "Fallback Failure",
+			consistentReadsEnabled:  true,
+			watchCacheRV:            "2",
+			storageRV:               "42",
+			fallbackError:           true,
+			expectError:             true,
+			expectBlock:             true,
+			expectRequestsToStorage: 2,
+			expectMetric: `
+# HELP apiserver_watch_cache_consistent_read_total [ALPHA] Counter for consistent reads from cache.
+# TYPE apiserver_watch_cache_consistent_read_total counter
+apiserver_watch_cache_consistent_read_total{fallback="true", group="", resource="pods", success="false"} 1
+`,
+		},
+		{
+			name:                    "Disabled",
+			watchCacheRV:            "2",
+			storageRV:               "42",
+			expectRV:                "42",
+			expectRequestsToStorage: 1,
+			expectMetric:            ``,
+		},
+	}
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ConsistentListFromCache, tc.consistentReadsEnabled)
+			if tc.consistentReadsEnabled {
+				forceRequestWatchProgressSupport(t)
+			}
+
+			registry := k8smetrics.NewKubeRegistry()
+			metrics.ConsistentReadTotal.Reset()
+			if err := registry.Register(metrics.ConsistentReadTotal); err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+			backingStorage := &dummyStorage{}
+			backingStorage.getListFn = func(_ context.Context, key string, opts storage.ListOptions, listObj runtime.Object) error {
+				podList := listObj.(*example.PodList)
+				podList.ResourceVersion = tc.watchCacheRV
+				return nil
+			}
+			c := testingclock.NewFakeClock(time.Now())
+			cacher, _, err := newTestCacherWithoutSyncing(backingStorage, c)
+			if err != nil {
+				t.Fatalf("Couldn't create cacher: %v", err)
+			}
+			defer cacher.Stop()
+			delegator := NewCacheDelegator(cacher, backingStorage)
+			defer delegator.Stop()
+			if err := cacher.ready.wait(context.Background()); err != nil {
+				t.Fatalf("unexpected error waiting for the cache to be ready")
+			}
+
+			if fmt.Sprintf("%d", cacher.watchCache.resourceVersion) != tc.watchCacheRV {
+				t.Fatalf("Expected watch cache RV to equal watchCacheRV, got: %d, want: %s", cacher.watchCache.resourceVersion, tc.watchCacheRV)
+			}
+			requestToStorageCount := 0
+			backingStorage.getListFn = func(_ context.Context, key string, opts storage.ListOptions, listObj runtime.Object) error {
+				requestToStorageCount += 1
+				podList := listObj.(*example.PodList)
+				if key == cacher.resourcePrefix {
+					podList.ResourceVersion = tc.storageRV
+					return nil
+				}
+				if tc.fallbackError {
+					return errDummy
+				}
+				podList.ResourceVersion = tc.storageRV
+				return nil
+			}
+			backingStorage.getRVFn = func(_ context.Context) (uint64, error) {
+				requestToStorageCount += 1
+				rv, err := strconv.Atoi(tc.storageRV)
+				if err != nil {
+					t.Fatalf("failed to parse RV: %s", err)
+				}
+				return uint64(rv), nil
+			}
+			result := &example.PodList{}
+
+			ctx, clockStepCancelFn := context.WithTimeout(context.TODO(), time.Minute)
+			defer clockStepCancelFn()
+			if tc.expectBlock {
+				go func(ctx context.Context) {
+					for {
+						select {
+						case <-ctx.Done():
+							return
+						default:
+							if c.HasWaiters() {
+								c.Step(blockTimeout)
+							}
+							time.Sleep(time.Millisecond)
+						}
+					}
+				}(ctx)
+			}
+
+			start := cacher.clock.Now()
+			err = delegator.GetList(context.TODO(), "pods/ns", storage.ListOptions{ResourceVersion: "", Recursive: true}, result)
+			clockStepCancelFn()
+			duration := cacher.clock.Since(start)
+			if (err != nil) != tc.expectError {
+				t.Fatalf("Unexpected error err: %v", err)
+			}
+			if result.ResourceVersion != tc.expectRV {
+				t.Fatalf("Unexpected List response RV, got: %q, want: %q", result.ResourceVersion, tc.expectRV)
+			}
+			if requestToStorageCount != tc.expectRequestsToStorage {
+				t.Fatalf("Unexpected number of requests to storage, got: %d, want: %d", requestToStorageCount, tc.expectRequestsToStorage)
+			}
+			blocked := duration >= blockTimeout
+			if blocked != tc.expectBlock {
+				t.Fatalf("Unexpected block, got: %v, want: %v", blocked, tc.expectBlock)
+			}
+
+			if err := testutil.GatherAndCompare(registry, strings.NewReader(tc.expectMetric), "apiserver_watch_cache_consistent_read_total"); err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestMatchExactResourceVersionFallback(t *testing.T) {
+	tcs := []struct {
+		name               string
+		snapshotsAvailable []bool
+
+		expectStoreRequests    int
+		expectSnapshotRequests int
+	}{
+		{
+			name:                   "Disabled",
+			snapshotsAvailable:     []bool{false, false},
+			expectStoreRequests:    2,
+			expectSnapshotRequests: 1,
+		},
+		{
+			name:                   "Enabled",
+			snapshotsAvailable:     []bool{true, true},
+			expectStoreRequests:    1,
+			expectSnapshotRequests: 2,
+		},
+		{
+			name:                   "Fallback",
+			snapshotsAvailable:     []bool{true, false},
+			expectSnapshotRequests: 2,
+			expectStoreRequests:    2,
+		},
+	}
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ListFromCacheSnapshot, true)
+			backingStorage := &dummyStorage{}
+			expectStoreRequests := 0
+			backingStorage.getListFn = func(_ context.Context, key string, opts storage.ListOptions, listObj runtime.Object) error {
+				expectStoreRequests++
+				podList := listObj.(*example.PodList)
+				switch opts.ResourceVersionMatch {
+				case "":
+					podList.ResourceVersion = "42"
+				case metav1.ResourceVersionMatchExact:
+					podList.ResourceVersion = opts.ResourceVersion
+				}
+				return nil
+			}
+			cacher, _, err := newTestCacherWithoutSyncing(backingStorage, clock.RealClock{})
+			if err != nil {
+				t.Fatalf("Couldn't create cacher: %v", err)
+			}
+			defer cacher.Stop()
+			snapshotRequestCount := 0
+			cacher.watchCache.RWMutex.Lock()
+			cacher.watchCache.snapshots = &fakeSnapshotter{
+				getLessOrEqual: func(rv uint64) (orderedLister, bool) {
+					snapshotAvailable := tc.snapshotsAvailable[snapshotRequestCount]
+					snapshotRequestCount++
+					if snapshotAvailable {
+						return fakeOrderedLister{}, true
+					} else {
+						return nil, false
+					}
+				},
+			}
+			cacher.watchCache.RWMutex.Unlock()
+			if err := cacher.ready.wait(context.Background()); err != nil {
+				t.Fatalf("unexpected error waiting for the cache to be ready")
+			}
+			delegator := NewCacheDelegator(cacher, backingStorage)
+
+			result := &example.PodList{}
+			err = delegator.GetList(context.TODO(), "pods/ns", storage.ListOptions{ResourceVersion: "20", ResourceVersionMatch: metav1.ResourceVersionMatchExact, Recursive: true}, result)
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+			if result.ResourceVersion != "20" {
+				t.Fatalf("Unexpected List response RV, got: %q, want: %d", result.ResourceVersion, 20)
+			}
+			if expectStoreRequests != tc.expectStoreRequests {
+				t.Fatalf("Unexpected number of requests to storage, got: %d, want: %d", expectStoreRequests, tc.expectStoreRequests)
+			}
+			if snapshotRequestCount != tc.expectSnapshotRequests {
+				t.Fatalf("Unexpected number of requests to snapshots, got: %d, want: %d", snapshotRequestCount, tc.expectSnapshotRequests)
+			}
+
+		})
 	}
 }
 
 func TestGetListNonRecursiveCacheBypass(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ConsistentListFromCache, false)
 	backingStorage := &dummyStorage{}
 	cacher, _, err := newTestCacher(backingStorage)
 	if err != nil {
 		t.Fatalf("Couldn't create cacher: %v", err)
 	}
 	defer cacher.Stop()
+	delegator := NewCacheDelegator(cacher, backingStorage)
+	defer delegator.Stop()
 
 	pred := storage.SelectionPredicate{
 		Limit: 500,
 	}
 	result := &example.PodList{}
 
-	// Wait until cacher is initialized.
-	if err := cacher.ready.wait(context.Background()); err != nil {
-		t.Fatalf("unexpected error waiting for the cache to be ready")
+	if !utilfeature.DefaultFeatureGate.Enabled(features.ResilientWatchCacheInitialization) {
+		if err := cacher.ready.wait(context.Background()); err != nil {
+			t.Fatalf("unexpected error waiting for the cache to be ready")
+		}
 	}
 
 	// Inject error to underlying layer and check if cacher is not bypassed.
-	backingStorage.injectError(errDummy)
-	err = cacher.GetList(context.TODO(), "pods/ns", storage.ListOptions{
+	backingStorage.injectGetListError(errDummy)
+	err = delegator.GetList(context.TODO(), "pods/ns", storage.ListOptions{
 		ResourceVersion: "0",
 		Predicate:       pred,
 	}, result)
@@ -236,15 +754,134 @@ func TestGetListNonRecursiveCacheBypass(t *testing.T) {
 		t.Errorf("GetList with Limit and RV=0 should be served from cache: %v", err)
 	}
 
-	err = cacher.GetList(context.TODO(), "pods/ns", storage.ListOptions{
+	err = delegator.GetList(context.TODO(), "pods/ns", storage.ListOptions{
 		ResourceVersion: "",
 		Predicate:       pred,
 	}, result)
-	if err != errDummy {
+	if !errors.Is(err, errDummy) {
 		t.Errorf("GetList with Limit without RV=0 should bypass cacher: %v", err)
 	}
 }
 
+func TestGetListNonRecursiveCacheWithConsistentListFromCache(t *testing.T) {
+	// Set feature gates once at the beginning since we only care about ConsistentListFromCache=true and ListFromCacheSnapshot=false
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ConsistentListFromCache, true)
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ListFromCacheSnapshot, false)
+	forceRequestWatchProgressSupport(t)
+
+	tests := []struct {
+		name                    string
+		consistentListFromCache bool
+		expectGetListCallCount  int
+		expectGetCurrentRV      bool
+		injectRVError           bool
+		expectedError           error
+	}{
+		{
+			name:                    "ConsistentListFromCache enabled - served from cache",
+			consistentListFromCache: true,
+			expectGetListCallCount:  1,
+			expectGetCurrentRV:      true,
+			injectRVError:           false,
+			expectedError:           nil,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var getListCount, getCurrentRVCount int
+			backingStorage := &dummyStorage{}
+
+			backingStorage.getListFn = func(ctx context.Context, key string, opts storage.ListOptions, listObj runtime.Object) error {
+				getListCount++
+				if tc.injectRVError {
+					return errDummy
+				}
+				podList := listObj.(*example.PodList)
+				podList.ListMeta = metav1.ListMeta{ResourceVersion: "100"}
+				return nil
+			}
+
+			backingStorage.getRVFn = func(ctx context.Context) (uint64, error) {
+				getCurrentRVCount++
+				rv := uint64(100)
+				err := error(nil)
+				if tc.injectRVError {
+					err = errDummy
+					return 0, err
+				}
+				return rv, nil
+			}
+
+			cacher, v, err := newTestCacher(backingStorage)
+			if err != nil {
+				t.Fatalf("Couldn't create cacher: %v", err)
+			}
+			defer cacher.Stop()
+
+			// Wait for cacher to be ready before injecting errors
+			if err := cacher.ready.wait(context.Background()); err != nil {
+				t.Fatalf("unexpected error waiting for the cache to be ready: %v", err)
+			}
+			delegator := NewCacheDelegator(cacher, backingStorage)
+			defer delegator.Stop()
+
+			// Setup test object
+			key := "pods/ns"
+			input := &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: "ns"}}
+			if err := v.UpdateObject(input, 100); err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+
+			// Put object into the store
+			if err := cacher.watchCache.Add(input); err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+
+			pred := storage.SelectionPredicate{
+				Label: labels.Everything(),
+				Field: fields.Everything(),
+				Limit: 500,
+			}
+			result := &example.PodList{}
+
+			// Make the list call with empty RV - delegator will get current RV and use it
+			err = delegator.GetList(context.TODO(), key, storage.ListOptions{
+				ResourceVersion: "",
+				Predicate:       pred,
+				Recursive:       true,
+			}, result)
+
+			// Verify error matches expectation
+			if !errors.Is(err, tc.expectedError) {
+				t.Errorf("Expected error %v, got: %v", tc.expectedError, err)
+			}
+
+			// Verify the correct storage method was called
+			if getListCount != tc.expectGetListCallCount {
+				t.Errorf("Expected GetList to be called %d times, but it was called %d times", tc.expectGetListCallCount, getListCount)
+			}
+			if tc.expectGetCurrentRV && getCurrentRVCount == 0 {
+				t.Error("Expected GetCurrentResourceVersion to be called, but it wasn't")
+			}
+			if !tc.expectGetCurrentRV && getCurrentRVCount > 0 {
+				t.Errorf("Expected GetCurrentResourceVersion not to be called, but it was called %d times", getCurrentRVCount)
+			}
+
+			// For successful cache reads, verify the resource version
+			if err == nil {
+				resultRV, err := cacher.versioner.ParseResourceVersion(result.ResourceVersion)
+				if err != nil {
+					t.Fatalf("Failed to parse result resource version: %v", err)
+				}
+				expectedRV := uint64(100)
+				if resultRV != expectedRV {
+					t.Errorf("Expected RV %d but got %d", expectedRV, resultRV)
+				}
+			}
+		})
+	}
+}
 func TestGetCacheBypass(t *testing.T) {
 	backingStorage := &dummyStorage{}
 	cacher, _, err := newTestCacher(backingStorage)
@@ -252,17 +889,20 @@ func TestGetCacheBypass(t *testing.T) {
 		t.Fatalf("Couldn't create cacher: %v", err)
 	}
 	defer cacher.Stop()
+	delegator := NewCacheDelegator(cacher, backingStorage)
+	defer delegator.Stop()
 
 	result := &example.Pod{}
 
-	// Wait until cacher is initialized.
-	if err := cacher.ready.wait(context.Background()); err != nil {
-		t.Fatalf("unexpected error waiting for the cache to be ready")
+	if !utilfeature.DefaultFeatureGate.Enabled(features.ResilientWatchCacheInitialization) {
+		if err := cacher.ready.wait(context.Background()); err != nil {
+			t.Fatalf("unexpected error waiting for the cache to be ready")
+		}
 	}
 
 	// Inject error to underlying layer and check if cacher is not bypassed.
-	backingStorage.injectError(errDummy)
-	err = cacher.Get(context.TODO(), "pods/ns/pod-0", storage.GetOptions{
+	backingStorage.injectGetListError(errDummy)
+	err = delegator.Get(context.TODO(), "pods/ns/pod-0", storage.GetOptions{
 		IgnoreNotFound:  true,
 		ResourceVersion: "0",
 	}, result)
@@ -270,11 +910,11 @@ func TestGetCacheBypass(t *testing.T) {
 		t.Errorf("Get with RV=0 should be served from cache: %v", err)
 	}
 
-	err = cacher.Get(context.TODO(), "pods/ns/pod-0", storage.GetOptions{
+	err = delegator.Get(context.TODO(), "pods/ns/pod-0", storage.GetOptions{
 		IgnoreNotFound:  true,
 		ResourceVersion: "",
 	}, result)
-	if err != errDummy {
+	if !errors.Is(err, errDummy) {
 		t.Errorf("Get without RV=0 should bypass cacher: %v", err)
 	}
 }
@@ -286,15 +926,16 @@ func TestWatchCacheBypass(t *testing.T) {
 		t.Fatalf("Couldn't create cacher: %v", err)
 	}
 	defer cacher.Stop()
+	delegator := NewCacheDelegator(cacher, backingStorage)
+	defer delegator.Stop()
 
-	// Wait until cacher is initialized.
-	if err := cacher.ready.wait(context.Background()); err != nil {
-		t.Fatalf("unexpected error waiting for the cache to be ready")
+	if !utilfeature.DefaultFeatureGate.Enabled(features.ResilientWatchCacheInitialization) {
+		if err := cacher.ready.wait(context.Background()); err != nil {
+			t.Fatalf("unexpected error waiting for the cache to be ready")
+		}
 	}
 
-	// Inject error to underlying layer and check if cacher is not bypassed.
-	backingStorage.injectError(errDummy)
-	_, err = cacher.Watch(context.TODO(), "pod/ns", storage.ListOptions{
+	_, err = delegator.Watch(context.TODO(), "pod/ns", storage.ListOptions{
 		ResourceVersion: "0",
 		Predicate:       storage.Everything,
 	})
@@ -302,12 +943,52 @@ func TestWatchCacheBypass(t *testing.T) {
 		t.Errorf("Watch with RV=0 should be served from cache: %v", err)
 	}
 
-	// With unset RV, check if cacher is bypassed.
-	_, err = cacher.Watch(context.TODO(), "pod/ns", storage.ListOptions{
+	_, err = delegator.Watch(context.TODO(), "pod/ns", storage.ListOptions{
 		ResourceVersion: "",
+		Predicate:       storage.Everything,
 	})
-	if err != errDummy {
-		t.Errorf("Watch with unset RV should bypass cacher: %v", err)
+	if err != nil {
+		t.Errorf("Watch without RV=0 should be served from cache: %v", err)
+	}
+}
+
+func TestTooManyRequestsNotReturned(t *testing.T) {
+	// Ensure that with ResilientWatchCacheInitialization feature disabled, we don't return 429
+	// errors when watchcache is not initialized.
+	featuregatetesting.SetFeatureGateEmulationVersionDuringTest(t, utilfeature.DefaultFeatureGate, version.MustParse("1.33"))
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ResilientWatchCacheInitialization, false)
+
+	dummyErr := fmt.Errorf("dummy")
+	backingStorage := &dummyStorage{getlistErr: dummyErr}
+	cacher, _, err := newTestCacherWithoutSyncing(backingStorage, clock.RealClock{})
+	if err != nil {
+		t.Fatalf("Couldn't create cacher: %v", err)
+	}
+	defer cacher.Stop()
+	delegator := NewCacheDelegator(cacher, backingStorage)
+	defer delegator.Stop()
+
+	opts := storage.ListOptions{
+		ResourceVersion: "0",
+		Predicate:       storage.Everything,
+	}
+
+	// Cancel the request so that it doesn't hang forever.
+	listCtx, listCancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer listCancel()
+
+	result := &example.PodList{}
+	err = delegator.GetList(listCtx, "/pods/ns", opts, result)
+	if err != nil && apierrors.IsTooManyRequests(err) {
+		t.Errorf("Unexpected 429 error without ResilientWatchCacheInitialization feature for List")
+	}
+
+	watchCtx, watchCancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer watchCancel()
+
+	_, err = delegator.Watch(watchCtx, "/pods/ns", opts)
+	if err != nil && apierrors.IsTooManyRequests(err) {
+		t.Errorf("Unexpected 429 error without ResilientWatchCacheInitialization feature for Watch")
 	}
 }
 
@@ -385,7 +1066,14 @@ func TestEmptyWatchEventCache(t *testing.T) {
 				if e, a := tt.expectedEvent.Object, event.Object; !apiequality.Semantic.DeepDerivative(e, a) {
 					t.Errorf("Expected: %#v, got: %#v", e, a)
 				}
-			case <-time.After(3 * time.Second):
+			case <-time.After(1 * time.Second):
+				// the watch was established otherwise
+				// we would be blocking on cache.Watch(...)
+				// in addition to that, the tests are serial in nature,
+				// meaning that there is no other actor
+				// that could add items to the database,
+				// which could result in receiving new items.
+				// given that waiting 1s seems okay
 				if tt.expectedEvent != nil {
 					t.Errorf("Failed to get an event")
 				}
@@ -399,8 +1087,8 @@ func TestWatchNotHangingOnStartupFailure(t *testing.T) {
 	// Configure cacher so that it can't initialize, because of
 	// constantly failing lists to the underlying storage.
 	dummyErr := fmt.Errorf("dummy")
-	backingStorage := &dummyStorage{err: dummyErr}
-	cacher, _, err := newTestCacher(backingStorage)
+	backingStorage := &dummyStorage{watchErr: dummyErr}
+	cacher, _, err := newTestCacherWithoutSyncing(backingStorage, testingclock.NewFakeClock(time.Now()))
 	if err != nil {
 		t.Fatalf("Couldn't create cacher: %v", err)
 	}
@@ -411,15 +1099,21 @@ func TestWatchNotHangingOnStartupFailure(t *testing.T) {
 	// terminate instead of hanging forever.
 	go func() {
 		defer cancel()
-		cacher.clock.Sleep(5 * time.Second)
+		cacher.clock.Sleep(1 * time.Second)
 	}()
 
 	// Watch hangs waiting on watchcache being initialized.
 	// Ensure that it terminates when its context is cancelled
 	// (e.g. the request is terminated for whatever reason).
 	_, err = cacher.Watch(ctx, "pods/ns", storage.ListOptions{ResourceVersion: "0"})
-	if err == nil || err.Error() != apierrors.NewServiceUnavailable(context.Canceled.Error()).Error() {
-		t.Errorf("Unexpected error: %#v", err)
+	if !utilfeature.DefaultFeatureGate.Enabled(features.ResilientWatchCacheInitialization) {
+		if err == nil || err.Error() != apierrors.NewServiceUnavailable(context.Canceled.Error()).Error() {
+			t.Errorf("Unexpected error: %#v", err)
+		}
+	} else {
+		if err == nil || !strings.Contains(err.Error(), "storage is (re)initializing") {
+			t.Errorf("Unexpected error: %#v", err)
+		}
 	}
 }
 
@@ -431,9 +1125,10 @@ func TestWatcherNotGoingBackInTime(t *testing.T) {
 	}
 	defer cacher.Stop()
 
-	// Wait until cacher is initialized.
-	if err := cacher.ready.wait(context.Background()); err != nil {
-		t.Fatalf("unexpected error waiting for the cache to be ready")
+	if !utilfeature.DefaultFeatureGate.Enabled(features.ResilientWatchCacheInitialization) {
+		if err := cacher.ready.wait(context.Background()); err != nil {
+			t.Fatalf("unexpected error waiting for the cache to be ready")
+		}
 	}
 
 	// Ensure there is some budget for slowing down processing.
@@ -516,13 +1211,16 @@ func TestCacherDontAcceptRequestsStopped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Couldn't create cacher: %v", err)
 	}
+	delegator := NewCacheDelegator(cacher, backingStorage)
+	defer delegator.Stop()
 
-	// Wait until cacher is initialized.
-	if err := cacher.ready.wait(context.Background()); err != nil {
-		t.Fatalf("unexpected error waiting for the cache to be ready")
+	if !utilfeature.DefaultFeatureGate.Enabled(features.ResilientWatchCacheInitialization) {
+		if err := cacher.ready.wait(context.Background()); err != nil {
+			t.Fatalf("unexpected error waiting for the cache to be ready")
+		}
 	}
 
-	w, err := cacher.Watch(context.Background(), "pods/ns", storage.ListOptions{ResourceVersion: "0", Predicate: storage.Everything})
+	w, err := delegator.Watch(context.Background(), "pods/ns", storage.ListOptions{ResourceVersion: "0", Predicate: storage.Everything})
 	if err != nil {
 		t.Fatalf("Failed to create watch: %v", err)
 	}
@@ -542,27 +1240,42 @@ func TestCacherDontAcceptRequestsStopped(t *testing.T) {
 
 	cacher.Stop()
 
-	_, err = cacher.Watch(context.Background(), "pods/ns", storage.ListOptions{ResourceVersion: "0", Predicate: storage.Everything})
+	_, err = delegator.Watch(context.Background(), "pods/ns", storage.ListOptions{ResourceVersion: "0", Predicate: storage.Everything})
 	if err == nil {
 		t.Fatalf("Success to create Watch: %v", err)
 	}
 
 	result := &example.Pod{}
-	err = cacher.Get(context.TODO(), "pods/ns/pod-0", storage.GetOptions{
+	err = delegator.Get(context.TODO(), "pods/ns/pod-0", storage.GetOptions{
 		IgnoreNotFound:  true,
 		ResourceVersion: "1",
 	}, result)
-	if err == nil {
-		t.Fatalf("Success to create Get: %v", err)
+	if !utilfeature.DefaultFeatureGate.Enabled(features.ResilientWatchCacheInitialization) {
+		if err == nil {
+			t.Fatalf("Success to create Get: %v", err)
+		}
+	} else {
+		if err != nil {
+			t.Fatalf("Failed to get object: %v:", err)
+		}
 	}
 
 	listResult := &example.PodList{}
-	err = cacher.GetList(context.TODO(), "pods/ns", storage.ListOptions{
+	err = delegator.GetList(context.TODO(), "pods/ns", storage.ListOptions{
 		ResourceVersion: "1",
 		Recursive:       true,
+		Predicate: storage.SelectionPredicate{
+			Limit: 500,
+		},
 	}, listResult)
-	if err == nil {
-		t.Fatalf("Success to create GetList: %v", err)
+	if !utilfeature.DefaultFeatureGate.Enabled(features.ResilientWatchCacheInitialization) {
+		if err != nil {
+			t.Fatalf("Failed to create GetList: %v", err)
+		}
+	} else {
+		if err != nil {
+			t.Fatalf("Failed to list objects: %v", err)
+		}
 	}
 
 	select {
@@ -594,6 +1307,7 @@ func TestCacherDontMissEventsOnReinitialization(t *testing.T) {
 			case 1:
 				podList.ListMeta = metav1.ListMeta{ResourceVersion: "10"}
 			default:
+				t.Errorf("unexpected list call: %d", listCalls)
 				err = fmt.Errorf("unexpected list call")
 			}
 			listCalls++
@@ -616,8 +1330,11 @@ func TestCacherDontMissEventsOnReinitialization(t *testing.T) {
 				for i := 12; i < 18; i++ {
 					w.Add(makePod(i))
 				}
-				w.Stop()
+				// Keep the watch open to avoid another reinitialization,
+				// but register it for cleanup.
+				t.Cleanup(func() { w.Stop() })
 			default:
+				t.Errorf("unexpected watch call: %d", watchCalls)
 				err = fmt.Errorf("unexpected watch call")
 			}
 			watchCalls++
@@ -639,7 +1356,6 @@ func TestCacherDontMissEventsOnReinitialization(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	errCh := make(chan error, concurrency)
 	for i := 0; i < concurrency; i++ {
 		go func() {
 			defer wg.Done()
@@ -663,11 +1379,11 @@ func TestCacherDontMissEventsOnReinitialization(t *testing.T) {
 				}
 				rv, err := strconv.Atoi(object.(*example.Pod).ResourceVersion)
 				if err != nil {
-					errCh <- fmt.Errorf("incorrect resource version: %v", err)
+					t.Errorf("incorrect resource version: %v", err)
 					return
 				}
 				if prevRV != -1 && prevRV+1 != rv {
-					errCh <- fmt.Errorf("unexpected event received, prevRV=%d, rv=%d", prevRV, rv)
+					t.Errorf("unexpected event received, prevRV=%d, rv=%d", prevRV, rv)
 					return
 				}
 				prevRV = rv
@@ -676,11 +1392,6 @@ func TestCacherDontMissEventsOnReinitialization(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	close(errCh)
-
-	for err := range errCh {
-		t.Error(err)
-	}
 }
 
 func TestCacherNoLeakWithMultipleWatchers(t *testing.T) {
@@ -691,10 +1402,12 @@ func TestCacherNoLeakWithMultipleWatchers(t *testing.T) {
 	}
 	defer cacher.Stop()
 
-	// Wait until cacher is initialized.
-	if err := cacher.ready.wait(context.Background()); err != nil {
-		t.Fatalf("unexpected error waiting for the cache to be ready")
+	if !utilfeature.DefaultFeatureGate.Enabled(features.ResilientWatchCacheInitialization) {
+		if err := cacher.ready.wait(context.Background()); err != nil {
+			t.Fatalf("unexpected error waiting for the cache to be ready")
+		}
 	}
+
 	pred := storage.Everything
 	pred.AllowWatchBookmarks = true
 
@@ -762,27 +1475,6 @@ func TestCacherNoLeakWithMultipleWatchers(t *testing.T) {
 	}
 }
 
-func TestWatchInitializationSignal(t *testing.T) {
-	backingStorage := &dummyStorage{}
-	cacher, _, err := newTestCacher(backingStorage)
-	if err != nil {
-		t.Fatalf("Couldn't create cacher: %v", err)
-	}
-	defer cacher.Stop()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	initSignal := utilflowcontrol.NewInitializationSignal()
-	ctx = utilflowcontrol.WithInitializationSignal(ctx, initSignal)
-
-	_, err = cacher.Watch(ctx, "pods/ns", storage.ListOptions{ResourceVersion: "0", Predicate: storage.Everything})
-	if err != nil {
-		t.Fatalf("Failed to create watch: %v", err)
-	}
-
-	initSignal.Wait()
-}
-
 func testCacherSendBookmarkEvents(t *testing.T, allowWatchBookmarks, expectedBookmarks bool) {
 	backingStorage := &dummyStorage{}
 	cacher, _, err := newTestCacher(backingStorage)
@@ -791,9 +1483,10 @@ func testCacherSendBookmarkEvents(t *testing.T, allowWatchBookmarks, expectedBoo
 	}
 	defer cacher.Stop()
 
-	// Wait until cacher is initialized.
-	if err := cacher.ready.wait(context.Background()); err != nil {
-		t.Fatalf("unexpected error waiting for the cache to be ready")
+	if !utilfeature.DefaultFeatureGate.Enabled(features.ResilientWatchCacheInitialization) {
+		if err := cacher.ready.wait(context.Background()); err != nil {
+			t.Fatalf("unexpected error waiting for the cache to be ready")
+		}
 	}
 	pred := storage.Everything
 	pred.AllowWatchBookmarks = allowWatchBookmarks
@@ -879,6 +1572,106 @@ func TestCacherSendBookmarkEvents(t *testing.T) {
 	}
 }
 
+func TestInitialEventsEndBookmark(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.WatchList, true)
+	forceRequestWatchProgressSupport(t)
+
+	backingStorage := &dummyStorage{}
+	cacher, _, err := newTestCacher(backingStorage)
+	if err != nil {
+		t.Fatalf("Couldn't create cacher: %v", err)
+	}
+	defer cacher.Stop()
+
+	if !utilfeature.DefaultFeatureGate.Enabled(features.ResilientWatchCacheInitialization) {
+		if err := cacher.ready.wait(context.Background()); err != nil {
+			t.Fatalf("unexpected error waiting for the cache to be ready")
+		}
+	}
+
+	makePod := func(index uint64) *example.Pod {
+		return &example.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            fmt.Sprintf("pod-%d", index),
+				Namespace:       "ns",
+				ResourceVersion: fmt.Sprintf("%v", 100+index),
+			},
+		}
+	}
+
+	numberOfPods := 3
+	var expectedPodEvents []watch.Event
+	for i := 1; i <= numberOfPods; i++ {
+		pod := makePod(uint64(i))
+		if err := cacher.watchCache.Add(pod); err != nil {
+			t.Fatalf("failed to add a pod: %v", err)
+		}
+		expectedPodEvents = append(expectedPodEvents, watch.Event{Type: watch.Added, Object: pod})
+	}
+	var currentResourceVersion uint64 = 100 + 3
+
+	trueVal, falseVal := true, false
+
+	scenarios := []struct {
+		name                string
+		allowWatchBookmarks bool
+		sendInitialEvents   *bool
+	}{
+		{
+			name:                "allowWatchBookmarks=false, sendInitialEvents=false",
+			allowWatchBookmarks: false,
+			sendInitialEvents:   &falseVal,
+		},
+		{
+			name:                "allowWatchBookmarks=false, sendInitialEvents=true",
+			allowWatchBookmarks: false,
+			sendInitialEvents:   &trueVal,
+		},
+		{
+			name:                "allowWatchBookmarks=true, sendInitialEvents=true",
+			allowWatchBookmarks: true,
+			sendInitialEvents:   &trueVal,
+		},
+		{
+			name:                "allowWatchBookmarks=true, sendInitialEvents=false",
+			allowWatchBookmarks: true,
+			sendInitialEvents:   &falseVal,
+		},
+		{
+			name:                "allowWatchBookmarks=false, sendInitialEvents=nil",
+			allowWatchBookmarks: true,
+		},
+	}
+
+	for _, scenario := range scenarios {
+		t.Run(scenario.name, func(t *testing.T) {
+			expectedWatchEvents := expectedPodEvents
+			if scenario.allowWatchBookmarks && scenario.sendInitialEvents != nil && *scenario.sendInitialEvents {
+				expectedWatchEvents = append(expectedWatchEvents, watch.Event{
+					Type: watch.Bookmark,
+					Object: &example.Pod{
+						ObjectMeta: metav1.ObjectMeta{
+							ResourceVersion: strconv.FormatUint(currentResourceVersion, 10),
+							Annotations:     map[string]string{metav1.InitialEventsAnnotationKey: "true"},
+						},
+					},
+				})
+			}
+
+			pred := storage.Everything
+			pred.AllowWatchBookmarks = scenario.allowWatchBookmarks
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+			defer cancel()
+			w, err := cacher.Watch(ctx, "pods/ns", storage.ListOptions{ResourceVersion: "100", SendInitialEvents: scenario.sendInitialEvents, Predicate: pred})
+			if err != nil {
+				t.Fatalf("Failed to create watch: %v", err)
+			}
+			storagetesting.TestCheckResultsInStrictOrder(t, w, expectedWatchEvents)
+			storagetesting.TestCheckNoMoreResultsWithIgnoreFunc(t, w, nil)
+		})
+	}
+}
+
 func TestCacherSendsMultipleWatchBookmarks(t *testing.T) {
 	backingStorage := &dummyStorage{}
 	cacher, _, err := newTestCacher(backingStorage)
@@ -891,9 +1684,10 @@ func TestCacherSendsMultipleWatchBookmarks(t *testing.T) {
 	// resolution how frequency we recompute.
 	cacher.bookmarkWatchers.bookmarkFrequency = time.Second
 
-	// Wait until cacher is initialized.
-	if err := cacher.ready.wait(context.Background()); err != nil {
-		t.Fatalf("unexpected error waiting for the cache to be ready")
+	if !utilfeature.DefaultFeatureGate.Enabled(features.ResilientWatchCacheInitialization) {
+		if err := cacher.ready.wait(context.Background()); err != nil {
+			t.Fatalf("unexpected error waiting for the cache to be ready")
+		}
 	}
 	pred := storage.Everything
 	pred.AllowWatchBookmarks = true
@@ -961,9 +1755,10 @@ func TestDispatchingBookmarkEventsWithConcurrentStop(t *testing.T) {
 	}
 	defer cacher.Stop()
 
-	// Wait until cacher is initialized.
-	if err := cacher.ready.wait(context.Background()); err != nil {
-		t.Fatalf("unexpected error waiting for the cache to be ready")
+	if !utilfeature.DefaultFeatureGate.Enabled(features.ResilientWatchCacheInitialization) {
+		if err := cacher.ready.wait(context.Background()); err != nil {
+			t.Fatalf("unexpected error waiting for the cache to be ready")
+		}
 	}
 
 	// Ensure there is some budget for slowing down processing.
@@ -1039,9 +1834,10 @@ func TestBookmarksOnResourceVersionUpdates(t *testing.T) {
 	// Ensure that bookmarks are sent more frequently than every 1m.
 	cacher.bookmarkWatchers = newTimeBucketWatchers(clock.RealClock{}, 2*time.Second)
 
-	// Wait until cacher is initialized.
-	if err := cacher.ready.wait(context.Background()); err != nil {
-		t.Fatalf("unexpected error waiting for the cache to be ready")
+	if !utilfeature.DefaultFeatureGate.Enabled(features.ResilientWatchCacheInitialization) {
+		if err := cacher.ready.wait(context.Background()); err != nil {
+			t.Fatalf("unexpected error waiting for the cache to be ready")
+		}
 	}
 
 	makePod := func(i int) *examplev1.Pod {
@@ -1117,9 +1913,10 @@ func TestStartingResourceVersion(t *testing.T) {
 	}
 	defer cacher.Stop()
 
-	// Wait until cacher is initialized.
-	if err := cacher.ready.wait(context.Background()); err != nil {
-		t.Fatalf("unexpected error waiting for the cache to be ready")
+	if !utilfeature.DefaultFeatureGate.Enabled(features.ResilientWatchCacheInitialization) {
+		if err := cacher.ready.wait(context.Background()); err != nil {
+			t.Fatalf("unexpected error waiting for the cache to be ready")
+		}
 	}
 
 	// Ensure there is some budget for slowing down processing.
@@ -1197,9 +1994,10 @@ func TestDispatchEventWillNotBeBlockedByTimedOutWatcher(t *testing.T) {
 	}
 	defer cacher.Stop()
 
-	// Wait until cacher is initialized.
-	if err := cacher.ready.wait(context.Background()); err != nil {
-		t.Fatalf("unexpected error waiting for the cache to be ready")
+	if !utilfeature.DefaultFeatureGate.Enabled(features.ResilientWatchCacheInitialization) {
+		if err := cacher.ready.wait(context.Background()); err != nil {
+			t.Fatalf("unexpected error waiting for the cache to be ready")
+		}
 	}
 
 	// Ensure there is some budget for slowing down processing.
@@ -1313,7 +2111,7 @@ func verifyEvents(t *testing.T, w watch.Interface, events []watch.Event, strictO
 			if !valid {
 				t.Logf("(called from line %d)", line)
 				for _, err := range errors {
-					t.Errorf(err)
+					t.Error(err)
 				}
 			}
 		}
@@ -1331,15 +2129,6 @@ func verifyEvents(t *testing.T, w watch.Interface, events []watch.Event, strictO
 	}
 }
 
-func verifyNoEvents(t *testing.T, w watch.Interface) {
-	select {
-	case e := <-w.ResultChan():
-		t.Errorf("Unexpected: %#v event received, expected no events", e)
-	case <-time.After(time.Second):
-		return
-	}
-}
-
 func TestCachingDeleteEvents(t *testing.T) {
 	backingStorage := &dummyStorage{}
 	cacher, _, err := newTestCacher(backingStorage)
@@ -1348,9 +2137,10 @@ func TestCachingDeleteEvents(t *testing.T) {
 	}
 	defer cacher.Stop()
 
-	// Wait until cacher is initialized.
-	if err := cacher.ready.wait(context.Background()); err != nil {
-		t.Fatalf("unexpected error waiting for the cache to be ready")
+	if !utilfeature.DefaultFeatureGate.Enabled(features.ResilientWatchCacheInitialization) {
+		if err := cacher.ready.wait(context.Background()); err != nil {
+			t.Fatalf("unexpected error waiting for the cache to be ready")
+		}
 	}
 
 	fooPredicate := storage.SelectionPredicate{
@@ -1430,9 +2220,10 @@ func testCachingObjects(t *testing.T, watchersCount int) {
 	}
 	defer cacher.Stop()
 
-	// Wait until cacher is initialized.
-	if err := cacher.ready.wait(context.Background()); err != nil {
-		t.Fatalf("unexpected error waiting for the cache to be ready")
+	if !utilfeature.DefaultFeatureGate.Enabled(features.ResilientWatchCacheInitialization) {
+		if err := cacher.ready.wait(context.Background()); err != nil {
+			t.Fatalf("unexpected error waiting for the cache to be ready")
+		}
 	}
 
 	dispatchedEvents := []*watchCacheEvent{}
@@ -1526,10 +2317,12 @@ func TestCacheIntervalInvalidationStopsWatch(t *testing.T) {
 	}
 	defer cacher.Stop()
 
-	// Wait until cacher is initialized.
-	if err := cacher.ready.wait(context.Background()); err != nil {
-		t.Fatalf("unexpected error waiting for the cache to be ready")
+	if !utilfeature.DefaultFeatureGate.Enabled(features.ResilientWatchCacheInitialization) {
+		if err := cacher.ready.wait(context.Background()); err != nil {
+			t.Fatalf("unexpected error waiting for the cache to be ready")
+		}
 	}
+
 	// Ensure there is enough budget for slow processing since
 	// the entire watch cache is going to be served through the
 	// interval and events won't be popped from the cacheWatcher's
@@ -1602,319 +2395,183 @@ func TestCacheIntervalInvalidationStopsWatch(t *testing.T) {
 	}
 }
 
-func TestCacherWatchSemantics(t *testing.T) {
-	trueVal, falseVal := true, false
-	makePod := func(rv uint64) *example.Pod {
-		return &example.Pod{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:            fmt.Sprintf("pod-%d", rv),
-				Namespace:       "ns",
-				ResourceVersion: fmt.Sprintf("%d", rv),
-				Annotations:     map[string]string{},
-			},
-		}
-	}
+func TestWaitUntilWatchCacheFreshAndForceAllEvents(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.WatchList, true)
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ConsistentListFromCache, true)
+	forceRequestWatchProgressSupport(t)
 
 	scenarios := []struct {
-		name                   string
-		allowWatchBookmarks    bool
-		sendInitialEvents      *bool
-		resourceVersion        string
-		storageResourceVersion string
-
-		initialPods                []*example.Pod
-		podsAfterEstablishingWatch []*example.Pod
-
-		expectedInitialEventsInStrictOrder   []watch.Event
-		expectedInitialEventsInRandomOrder   []watch.Event
-		expectedEventsAfterEstablishingWatch []watch.Event
+		name               string
+		opts               storage.ListOptions
+		backingStorage     *dummyStorage
+		verifyBackingStore func(t *testing.T, s *dummyStorage)
 	}{
 		{
-			name:                               "allowWatchBookmarks=true, sendInitialEvents=true, RV=unset, storageRV=102",
-			allowWatchBookmarks:                true,
-			sendInitialEvents:                  &trueVal,
-			storageResourceVersion:             "102",
-			initialPods:                        []*example.Pod{makePod(101)},
-			podsAfterEstablishingWatch:         []*example.Pod{makePod(102)},
-			expectedInitialEventsInRandomOrder: []watch.Event{{Type: watch.Added, Object: makePod(101)}},
-			expectedEventsAfterEstablishingWatch: []watch.Event{
-				{Type: watch.Added, Object: makePod(102)},
-				{Type: watch.Bookmark, Object: &example.Pod{
-					ObjectMeta: metav1.ObjectMeta{
-						ResourceVersion: "102",
-						Annotations:     map[string]string{"k8s.io/initial-events-end": "true"},
-					},
-				}},
+			name: "allowWatchBookmarks=true, sendInitialEvents=true, RV=105",
+			opts: storage.ListOptions{
+				Predicate: func() storage.SelectionPredicate {
+					p := storage.Everything
+					p.AllowWatchBookmarks = true
+					return p
+				}(),
+				SendInitialEvents: ptr.To(true),
+				ResourceVersion:   "105",
+			},
+			verifyBackingStore: func(t *testing.T, s *dummyStorage) {
+				require.NotEqual(t, 0, s.getRequestWatchProgressCounter(), "expected store.RequestWatchProgressCounter to be > 0. It looks like watch progress wasn't requested!")
 			},
 		},
+
 		{
-			name:                   "allowWatchBookmarks=true, sendInitialEvents=true, RV=0, storageRV=105",
-			allowWatchBookmarks:    true,
-			sendInitialEvents:      &trueVal,
-			resourceVersion:        "0",
-			storageResourceVersion: "105",
-			initialPods:            []*example.Pod{makePod(101), makePod(102)},
-			expectedInitialEventsInRandomOrder: []watch.Event{
-				{Type: watch.Added, Object: makePod(101)},
-				{Type: watch.Added, Object: makePod(102)},
+			name: "legacy: allowWatchBookmarks=false, sendInitialEvents=true, RV=unset",
+			opts: storage.ListOptions{
+				Predicate: func() storage.SelectionPredicate {
+					p := storage.Everything
+					p.AllowWatchBookmarks = false
+					return p
+				}(),
+				SendInitialEvents: ptr.To(true),
 			},
-			expectedInitialEventsInStrictOrder: []watch.Event{
-				{Type: watch.Bookmark, Object: &example.Pod{
-					ObjectMeta: metav1.ObjectMeta{
-						ResourceVersion: "102",
-						Annotations:     map[string]string{"k8s.io/initial-events-end": "true"},
-					},
-				}},
+			backingStorage: func() *dummyStorage {
+				hasBeenPrimed := false
+				s := &dummyStorage{}
+				s.getListFn = func(_ context.Context, key string, opts storage.ListOptions, listObj runtime.Object) error {
+					listAccessor, err := meta.ListAccessor(listObj)
+					if err != nil {
+						return err
+					}
+					// the first call to this function
+					// primes the cacher
+					if !hasBeenPrimed {
+						listAccessor.SetResourceVersion("100")
+						hasBeenPrimed = true
+						return nil
+					}
+					listAccessor.SetResourceVersion("105")
+					return nil
+				}
+				s.getRVFn = func(_ context.Context) (uint64, error) {
+					// the first call to this function
+					// primes the cacher
+					if !hasBeenPrimed {
+						hasBeenPrimed = true
+						return 100, nil
+					}
+					return 105, nil
+				}
+				return s
+			}(),
+			verifyBackingStore: func(t *testing.T, s *dummyStorage) {
+				require.NotEqual(t, 0, s.getRequestWatchProgressCounter(), "expected store.RequestWatchProgressCounter to be > 0. It looks like watch progress wasn't requested!")
 			},
 		},
+
 		{
-			name:                               "allowWatchBookmarks=true, sendInitialEvents=true, RV=101, storageRV=105",
-			allowWatchBookmarks:                true,
-			sendInitialEvents:                  &trueVal,
-			resourceVersion:                    "101",
-			storageResourceVersion:             "105",
-			initialPods:                        []*example.Pod{makePod(101), makePod(102)},
-			expectedInitialEventsInRandomOrder: []watch.Event{{Type: watch.Added, Object: makePod(101)}, {Type: watch.Added, Object: makePod(102)}},
-			expectedInitialEventsInStrictOrder: []watch.Event{
-				{Type: watch.Bookmark, Object: &example.Pod{
-					ObjectMeta: metav1.ObjectMeta{
-						ResourceVersion: "102",
-						Annotations:     map[string]string{"k8s.io/initial-events-end": "true"},
-					},
-				}},
+			name: "allowWatchBookmarks=true, sendInitialEvents=true, RV=unset",
+			opts: storage.ListOptions{
+				Predicate: func() storage.SelectionPredicate {
+					p := storage.Everything
+					p.AllowWatchBookmarks = true
+					return p
+				}(),
+				SendInitialEvents: ptr.To(true),
 			},
-		},
-		{
-			name:                                 "allowWatchBookmarks=false, sendInitialEvents=true, RV=unset, storageRV=102",
-			sendInitialEvents:                    &trueVal,
-			storageResourceVersion:               "102",
-			initialPods:                          []*example.Pod{makePod(101)},
-			expectedInitialEventsInRandomOrder:   []watch.Event{{Type: watch.Added, Object: makePod(101)}},
-			podsAfterEstablishingWatch:           []*example.Pod{makePod(102)},
-			expectedEventsAfterEstablishingWatch: []watch.Event{{Type: watch.Added, Object: makePod(102)}},
-		},
-		{
-			// note we set storage's RV to some future value, mustn't be used by this scenario
-			name:                               "allowWatchBookmarks=false, sendInitialEvents=true, RV=0, storageRV=105",
-			sendInitialEvents:                  &trueVal,
-			resourceVersion:                    "0",
-			storageResourceVersion:             "105",
-			initialPods:                        []*example.Pod{makePod(101), makePod(102)},
-			expectedInitialEventsInRandomOrder: []watch.Event{{Type: watch.Added, Object: makePod(101)}, {Type: watch.Added, Object: makePod(102)}},
-		},
-		{
-			// note we set storage's RV to some future value, mustn't be used by this scenario
-			name:                   "allowWatchBookmarks=false, sendInitialEvents=true, RV=101, storageRV=105",
-			sendInitialEvents:      &trueVal,
-			resourceVersion:        "101",
-			storageResourceVersion: "105",
-			initialPods:            []*example.Pod{makePod(101), makePod(102)},
-			// make sure we only get initial events that are > initial RV (101)
-			expectedInitialEventsInRandomOrder: []watch.Event{{Type: watch.Added, Object: makePod(101)}, {Type: watch.Added, Object: makePod(102)}},
-		},
-		{
-			name:                                 "sendInitialEvents=false, RV=unset, storageRV=103",
-			sendInitialEvents:                    &falseVal,
-			storageResourceVersion:               "103",
-			initialPods:                          []*example.Pod{makePod(101), makePod(102)},
-			podsAfterEstablishingWatch:           []*example.Pod{makePod(104)},
-			expectedEventsAfterEstablishingWatch: []watch.Event{{Type: watch.Added, Object: makePod(104)}},
-		},
-		{
-			// note we set storage's RV to some future value, mustn't be used by this scenario
-			name:                                 "sendInitialEvents=false, RV=0, storageRV=105",
-			sendInitialEvents:                    &falseVal,
-			resourceVersion:                      "0",
-			storageResourceVersion:               "105",
-			initialPods:                          []*example.Pod{makePod(101), makePod(102)},
-			podsAfterEstablishingWatch:           []*example.Pod{makePod(103)},
-			expectedEventsAfterEstablishingWatch: []watch.Event{{Type: watch.Added, Object: makePod(103)}},
-		},
-		{
-			// note we set storage's RV to some future value, mustn't be used by this scenario
-			name:                               "legacy, RV=0, storageRV=105",
-			resourceVersion:                    "0",
-			storageResourceVersion:             "105",
-			initialPods:                        []*example.Pod{makePod(101), makePod(102)},
-			expectedInitialEventsInRandomOrder: []watch.Event{{Type: watch.Added, Object: makePod(101)}, {Type: watch.Added, Object: makePod(102)}},
-		},
-		{
-			// note we set storage's RV to some future value, mustn't be used by this scenario
-			name:                   "legacy, RV=unset, storageRV=105",
-			storageResourceVersion: "105",
-			initialPods:            []*example.Pod{makePod(101), makePod(102)},
-			// no events because the watch is delegated to the underlying storage
+			backingStorage: func() *dummyStorage {
+				hasBeenPrimed := false
+				s := &dummyStorage{}
+				s.getListFn = func(_ context.Context, key string, opts storage.ListOptions, listObj runtime.Object) error {
+					listAccessor, err := meta.ListAccessor(listObj)
+					if err != nil {
+						return err
+					}
+					// the first call to this function
+					// primes the cacher
+					if !hasBeenPrimed {
+						listAccessor.SetResourceVersion("100")
+						hasBeenPrimed = true
+						return nil
+					}
+					listAccessor.SetResourceVersion("105")
+					return nil
+				}
+				s.getRVFn = func(_ context.Context) (uint64, error) {
+					// the first call to this function
+					// primes the cacher
+					if !hasBeenPrimed {
+						hasBeenPrimed = true
+						return 100, nil
+					}
+					return 105, nil
+				}
+				return s
+			}(),
+			verifyBackingStore: func(t *testing.T, s *dummyStorage) {
+				require.NotEqual(t, 0, s.getRequestWatchProgressCounter(), "expected store.RequestWatchProgressCounter to be > 0. It looks like watch progress wasn't requested!")
+			},
 		},
 	}
+
 	for _, scenario := range scenarios {
 		t.Run(scenario.name, func(t *testing.T) {
-			// set up env
-			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.WatchList, true)()
-			storageListMetaResourceVersion := ""
-			backingStorage := &dummyStorage{getListFn: func(_ context.Context, _ string, _ storage.ListOptions, listObj runtime.Object) error {
-				podList := listObj.(*example.PodList)
-				podList.ListMeta = metav1.ListMeta{ResourceVersion: storageListMetaResourceVersion}
-				return nil
-			}}
-
+			t.Parallel()
+			var backingStorage *dummyStorage
+			if scenario.backingStorage != nil {
+				backingStorage = scenario.backingStorage
+			} else {
+				backingStorage = &dummyStorage{}
+			}
 			cacher, _, err := newTestCacher(backingStorage)
 			if err != nil {
-				t.Fatalf("falied to create cacher: %v", err)
+				t.Fatalf("Couldn't create cacher: %v", err)
 			}
 			defer cacher.Stop()
-			if err := cacher.ready.wait(context.TODO()); err != nil {
-				t.Fatalf("unexpected error waiting for the cache to be ready")
+
+			if !utilfeature.DefaultFeatureGate.Enabled(features.ResilientWatchCacheInitialization) {
+				if err := cacher.ready.wait(context.Background()); err != nil {
+					t.Fatalf("unexpected error waiting for the cache to be ready")
+				}
 			}
 
-			// now, run a scenario
-			// but first let's add some initial data
-			for _, obj := range scenario.initialPods {
-				err = cacher.watchCache.Add(obj)
-				require.NoError(t, err, "failed to add a pod: %v")
-			}
-			// read request params
-			opts := storage.ListOptions{Predicate: storage.Everything}
-			opts.SendInitialEvents = scenario.sendInitialEvents
-			opts.Predicate.AllowWatchBookmarks = scenario.allowWatchBookmarks
-			if len(scenario.resourceVersion) > 0 {
-				opts.ResourceVersion = scenario.resourceVersion
-			}
-			// before starting a new watch set a storage RV to some future value
-			storageListMetaResourceVersion = scenario.storageResourceVersion
-
-			w, err := cacher.Watch(context.Background(), "pods/ns", opts)
+			w, err := cacher.Watch(context.Background(), "pods/ns", scenario.opts)
 			require.NoError(t, err, "failed to create watch: %v")
 			defer w.Stop()
-
-			// make sure we only get initial events
-			verifyEvents(t, w, scenario.expectedInitialEventsInRandomOrder, false)
-			verifyEvents(t, w, scenario.expectedInitialEventsInStrictOrder, true)
-			verifyNoEvents(t, w)
-			// add a pod that is greater than the storage's RV when the watch was started
-			for _, obj := range scenario.podsAfterEstablishingWatch {
-				err = cacher.watchCache.Add(obj)
-				require.NoError(t, err, "failed to add a pod: %v")
+			var expectedErr *apierrors.StatusError
+			if !errors.As(storage.NewTooLargeResourceVersionError(105, 100, resourceVersionTooHighRetrySeconds), &expectedErr) {
+				t.Fatalf("Unable to convert NewTooLargeResourceVersionError to apierrors.StatusError")
 			}
-			verifyEvents(t, w, scenario.expectedEventsAfterEstablishingWatch, true)
-			verifyNoEvents(t, w)
+			verifyEvents(t, w, []watch.Event{
+				{
+					Type: watch.Error,
+					Object: &metav1.Status{
+						Status:  metav1.StatusFailure,
+						Message: expectedErr.Error(),
+						Details: expectedErr.ErrStatus.Details,
+						Reason:  metav1.StatusReasonTimeout,
+						Code:    504,
+					},
+				},
+			}, true)
+
+			go func(t *testing.T) {
+				err := cacher.watchCache.Add(makeTestPodDetails("pod1", 105, "node1", map[string]string{"label": "value1"}))
+				if err != nil {
+					t.Errorf("failed adding a pod to the watchCache %v", err)
+				}
+			}(t)
+			w, err = cacher.Watch(context.Background(), "pods/ns", scenario.opts)
+			require.NoError(t, err, "failed to create watch: %v")
+			defer w.Stop()
+			verifyEvents(t, w, []watch.Event{
+				{
+					Type:   watch.Added,
+					Object: makeTestPodDetails("pod1", 105, "node1", map[string]string{"label": "value1"}),
+				},
+			}, true)
+			if scenario.verifyBackingStore != nil {
+				scenario.verifyBackingStore(t, backingStorage)
+			}
 		})
 	}
-}
-
-func TestGetCurrentResourceVersionFromStorage(t *testing.T) {
-	// test data
-	newEtcdTestStorage := func(t *testing.T, prefix string) (*etcd3testing.EtcdTestServer, storage.Interface) {
-		server, _ := etcd3testing.NewUnsecuredEtcd3TestClientServer(t)
-		storage := etcd3.New(server.V3Client, apitesting.TestCodec(codecs, examplev1.SchemeGroupVersion, example2v1.SchemeGroupVersion), func() runtime.Object { return &example.Pod{} }, prefix, schema.GroupResource{Resource: "pods"}, identity.NewEncryptCheckTransformer(), true, etcd3.NewDefaultLeaseManagerConfig())
-		return server, storage
-	}
-	server, etcdStorage := newEtcdTestStorage(t, "")
-	defer server.Terminate(t)
-	podCacher, versioner, err := newTestCacher(etcdStorage)
-	if err != nil {
-		t.Fatalf("Couldn't create podCacher: %v", err)
-	}
-	defer podCacher.Stop()
-
-	makePod := func(name string) *example.Pod {
-		return &example.Pod{
-			ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: name},
-		}
-	}
-	createPod := func(obj *example.Pod) *example.Pod {
-		key := "pods/" + obj.Namespace + "/" + obj.Name
-		out := &example.Pod{}
-		err := etcdStorage.Create(context.TODO(), key, obj, out, 0)
-		require.NoError(t, err)
-		return out
-	}
-	getPod := func(name, ns string) *example.Pod {
-		key := "pods/" + ns + "/" + name
-		out := &example.Pod{}
-		err := etcdStorage.Get(context.TODO(), key, storage.GetOptions{}, out)
-		require.NoError(t, err)
-		return out
-	}
-	makeReplicaSet := func(name string) *example2v1.ReplicaSet {
-		return &example2v1.ReplicaSet{
-			ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: name},
-		}
-	}
-	createReplicaSet := func(obj *example2v1.ReplicaSet) *example2v1.ReplicaSet {
-		key := "replicasets/" + obj.Namespace + "/" + obj.Name
-		out := &example2v1.ReplicaSet{}
-		err := etcdStorage.Create(context.TODO(), key, obj, out, 0)
-		require.NoError(t, err)
-		return out
-	}
-
-	// create a pod and make sure its RV is equal to the one maintained by etcd
-	pod := createPod(makePod("pod-1"))
-	currentStorageRV, err := podCacher.getCurrentResourceVersionFromStorage(context.TODO())
-	require.NoError(t, err)
-	podRV, err := versioner.ParseResourceVersion(pod.ResourceVersion)
-	require.NoError(t, err)
-	require.Equal(t, currentStorageRV, podRV, "expected the global etcd RV to be equal to pod's RV")
-
-	// now create a replicaset (new resource) and make sure the target function returns global etcd RV
-	rs := createReplicaSet(makeReplicaSet("replicaset-1"))
-	currentStorageRV, err = podCacher.getCurrentResourceVersionFromStorage(context.TODO())
-	require.NoError(t, err)
-	rsRV, err := versioner.ParseResourceVersion(rs.ResourceVersion)
-	require.NoError(t, err)
-	require.Equal(t, currentStorageRV, rsRV, "expected the global etcd RV to be equal to replicaset's RV")
-
-	// ensure that the pod's RV hasn't been changed
-	currentPod := getPod(pod.Name, pod.Namespace)
-	currentPodRV, err := versioner.ParseResourceVersion(currentPod.ResourceVersion)
-	require.NoError(t, err)
-	require.Equal(t, currentPodRV, podRV, "didn't expect to see the pod's RV changed")
-}
-
-func TestWaitUntilWatchCacheFreshAndForceAllEvents(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.WatchList, true)()
-	backingStorage := &dummyStorage{}
-	cacher, _, err := newTestCacher(backingStorage)
-	if err != nil {
-		t.Fatalf("Couldn't create cacher: %v", err)
-	}
-	defer cacher.Stop()
-
-	opts := storage.ListOptions{
-		Predicate:         storage.Everything,
-		SendInitialEvents: pointer.Bool(true),
-		ResourceVersion:   "105",
-	}
-	opts.Predicate.AllowWatchBookmarks = true
-
-	w, err := cacher.Watch(context.Background(), "pods/ns", opts)
-	require.NoError(t, err, "failed to create watch: %v")
-	defer w.Stop()
-	verifyEvents(t, w, []watch.Event{
-		{
-			Type: watch.Error,
-			Object: &metav1.Status{
-				Status:  metav1.StatusFailure,
-				Message: storage.NewTooLargeResourceVersionError(105, 100, resourceVersionTooHighRetrySeconds).Error(),
-				Details: storage.NewTooLargeResourceVersionError(105, 100, resourceVersionTooHighRetrySeconds).(*apierrors.StatusError).Status().Details,
-				Reason:  metav1.StatusReasonTimeout,
-				Code:    504,
-			},
-		},
-	}, true)
-
-	go func() {
-		cacher.watchCache.Add(makeTestPodDetails("pod1", 105, "node1", map[string]string{"label": "value1"}))
-	}()
-	w, err = cacher.Watch(context.Background(), "pods/ns", opts)
-	require.NoError(t, err, "failed to create watch: %v")
-	defer w.Stop()
-	verifyEvents(t, w, []watch.Event{
-		{
-			Type:   watch.Added,
-			Object: makeTestPodDetails("pod1", 105, "node1", map[string]string{"label": "value1"}),
-		},
-	}, true)
 }
 
 type fakeStorage struct {
@@ -1985,11 +2642,14 @@ func BenchmarkCacher_GetList(b *testing.B) {
 				}
 
 				// build test cacher
-				cacher, _, err := newTestCacher(newObjectStorage(fakePods))
+				store := newObjectStorage(fakePods)
+				cacher, _, err := newTestCacher(store)
 				if err != nil {
 					b.Fatalf("new cacher: %v", err)
 				}
 				defer cacher.Stop()
+				delegator := NewCacheDelegator(cacher, store)
+				defer delegator.Stop()
 
 				// prepare result and pred
 				parsedField, err := fields.ParseSelector("spec.nodeName=node-0")
@@ -2005,7 +2665,7 @@ func BenchmarkCacher_GetList(b *testing.B) {
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
 					result := &example.PodList{}
-					err = cacher.GetList(context.TODO(), "pods", storage.ListOptions{
+					err = delegator.GetList(context.TODO(), "pods", storage.ListOptions{
 						Predicate:       pred,
 						Recursive:       true,
 						ResourceVersion: "12345",
@@ -2021,58 +2681,871 @@ func BenchmarkCacher_GetList(b *testing.B) {
 	}
 }
 
-// TestDoNotPopExpiredWatchersWhenNoEventsSeen makes sure that
-// a bookmark event will be delivered after the cacher has seen an event.
-// Previously the watchers have been removed from the "want bookmark" queue.
-func TestDoNotPopExpiredWatchersWhenNoEventsSeen(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.WatchList, true)()
+// TestWatchListIsSynchronisedWhenNoEventsFromStoreReceived makes sure that
+// a bookmark event will be delivered even if the cacher has not received an event.
+func TestWatchListIsSynchronisedWhenNoEventsFromStoreReceived(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.WatchList, true)
 	backingStorage := &dummyStorage{}
 	cacher, _, err := newTestCacher(backingStorage)
-	if err != nil {
-		t.Fatalf("Couldn't create cacher: %v", err)
-	}
+	require.NoError(t, err, "failed to create cacher")
 	defer cacher.Stop()
 
-	// wait until cacher is initialized.
-	if err := cacher.ready.wait(context.Background()); err != nil {
-		t.Fatalf("unexpected error waiting for the cache to be ready")
+	if !utilfeature.DefaultFeatureGate.Enabled(features.ResilientWatchCacheInitialization) {
+		if err := cacher.ready.wait(context.Background()); err != nil {
+			t.Fatalf("unexpected error waiting for the cache to be ready")
+		}
 	}
 
 	pred := storage.Everything
 	pred.AllowWatchBookmarks = true
 	opts := storage.ListOptions{
 		Predicate:         pred,
-		SendInitialEvents: pointer.Bool(true),
+		SendInitialEvents: ptr.To(true),
 	}
 	w, err := cacher.Watch(context.Background(), "pods/ns", opts)
 	require.NoError(t, err, "failed to create watch: %v")
 	defer w.Stop()
 
-	// Ensure that popExpiredWatchers is called to ensure that our watch isn't removed from bookmarkWatchers.
-	// We do that every ~1s, so waiting 2 seconds seems enough.
-	time.Sleep(2 * time.Second)
-
-	// Send an event to ensure that lastProcessedResourceVersion in Cacher will change to non-zero value.
-	makePod := func(rv uint64) *example.Pod {
-		return &example.Pod{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:            fmt.Sprintf("pod-%d", rv),
-				Namespace:       "ns",
-				ResourceVersion: fmt.Sprintf("%d", rv),
-				Annotations:     map[string]string{},
-			},
-		}
-	}
-	err = cacher.watchCache.Add(makePod(102))
-	require.NoError(t, err)
-
 	verifyEvents(t, w, []watch.Event{
-		{Type: watch.Added, Object: makePod(102)},
 		{Type: watch.Bookmark, Object: &example.Pod{
 			ObjectMeta: metav1.ObjectMeta{
-				ResourceVersion: "102",
-				Annotations:     map[string]string{"k8s.io/initial-events-end": "true"},
+				ResourceVersion: "100",
+				Annotations:     map[string]string{metav1.InitialEventsAnnotationKey: "true"},
 			},
 		}},
 	}, true)
+}
+
+func TestForgetWatcher(t *testing.T) {
+	backingStorage := &dummyStorage{}
+	cacher, _, err := newTestCacher(backingStorage)
+	require.NoError(t, err)
+	defer cacher.Stop()
+
+	if !utilfeature.DefaultFeatureGate.Enabled(features.ResilientWatchCacheInitialization) {
+		if err := cacher.ready.wait(context.Background()); err != nil {
+			t.Fatalf("unexpected error waiting for the cache to be ready")
+		}
+	}
+
+	assertCacherInternalState := func(expectedWatchersCounter, expectedValueWatchersCounter int) {
+		cacher.Lock()
+		defer cacher.Unlock()
+
+		require.Len(t, cacher.watchers.allWatchers, expectedWatchersCounter)
+		require.Len(t, cacher.watchers.valueWatchers, expectedValueWatchersCounter)
+	}
+	assertCacherInternalState(0, 0)
+
+	var forgetWatcherFn func(bool)
+	var forgetCounter int
+	forgetWatcherWrapped := func(drainWatcher bool) {
+		forgetCounter++
+		forgetWatcherFn(drainWatcher)
+	}
+	w := newCacheWatcher(
+		0,
+		func(_ string, _ labels.Set, _ fields.Set) bool { return true },
+		nil,
+		storage.APIObjectVersioner{},
+		testingclock.NewFakeClock(time.Now()).Now().Add(2*time.Minute),
+		true,
+		schema.GroupResource{Resource: "pods"},
+		"1",
+	)
+	forgetWatcherFn = forgetWatcher(cacher, w, 0, namespacedName{}, "", false)
+	addWatcher := func(w *cacheWatcher) {
+		cacher.Lock()
+		defer cacher.Unlock()
+
+		cacher.watchers.addWatcher(w, 0, namespacedName{}, "", false)
+	}
+
+	addWatcher(w)
+	assertCacherInternalState(1, 0)
+
+	forgetWatcherWrapped(false)
+	assertCacherInternalState(0, 0)
+	require.Equal(t, 1, forgetCounter)
+
+	forgetWatcherWrapped(false)
+	assertCacherInternalState(0, 0)
+	require.Equal(t, 2, forgetCounter)
+}
+
+// TestGetWatchCacheResourceVersion test the following cases:
+//
+// +-----------------+---------------------+-----------------------+
+// | ResourceVersion | AllowWatchBookmarks | SendInitialEvents     |
+// +=================+=====================+=======================+
+// | Unset           | true/false          | nil/true/false        |
+// | 0               | true/false          | nil/true/false        |
+// | 95             | true/false          | nil/true/false         |
+// +-----------------+---------------------+-----------------------+
+// where:
+// - false indicates the value of the param was set to "false" by a test case
+// - true  indicates the value of the param was set to "true" by a test case
+func TestGetWatchCacheResourceVersion(t *testing.T) {
+	listOptions := func(allowBookmarks bool, sendInitialEvents *bool, rv string) storage.ListOptions {
+		p := storage.Everything
+		p.AllowWatchBookmarks = allowBookmarks
+
+		opts := storage.ListOptions{}
+		opts.Predicate = p
+		opts.SendInitialEvents = sendInitialEvents
+		opts.ResourceVersion = rv
+		return opts
+	}
+
+	scenarios := []struct {
+		name string
+		opts storage.ListOptions
+
+		expectedWatchResourceVersion int
+	}{
+		// +-----------------+---------------------+-----------------------+
+		// | ResourceVersion | AllowWatchBookmarks | SendInitialEvents     |
+		// +=================+=====================+=======================+
+		// | Unset           | true/false          | nil/true/false        |
+		// +-----------------+---------------------+-----------------------+
+		{
+			name: "RV=unset, allowWatchBookmarks=true, sendInitialEvents=nil",
+			opts: listOptions(true, nil, ""),
+			// Expecting RV 0, due to https://github.com/kubernetes/kubernetes/pull/123935 reverted to serving those requests from watch cache.
+			// Set to 100, when WatchFromStorageWithoutResourceVersion is set to true.
+			expectedWatchResourceVersion: 0,
+		},
+		{
+			name:                         "RV=unset, allowWatchBookmarks=true, sendInitialEvents=true",
+			opts:                         listOptions(true, ptr.To(true), ""),
+			expectedWatchResourceVersion: 100,
+		},
+		{
+			name:                         "RV=unset, allowWatchBookmarks=true, sendInitialEvents=false",
+			opts:                         listOptions(true, ptr.To(false), ""),
+			expectedWatchResourceVersion: 100,
+		},
+		{
+			name: "RV=unset, allowWatchBookmarks=false, sendInitialEvents=nil",
+			opts: listOptions(false, nil, ""),
+			// Expecting RV 0, due to https://github.com/kubernetes/kubernetes/pull/123935 reverted to serving those requests from watch cache.
+			// Set to 100, when WatchFromStorageWithoutResourceVersion is set to true.
+			expectedWatchResourceVersion: 0,
+		},
+		{
+			name:                         "RV=unset, allowWatchBookmarks=false, sendInitialEvents=true, legacy",
+			opts:                         listOptions(false, ptr.To(true), ""),
+			expectedWatchResourceVersion: 100,
+		},
+		{
+			name:                         "RV=unset, allowWatchBookmarks=false, sendInitialEvents=false",
+			opts:                         listOptions(false, ptr.To(false), ""),
+			expectedWatchResourceVersion: 100,
+		},
+		// +-----------------+---------------------+-----------------------+
+		// | ResourceVersion | AllowWatchBookmarks | SendInitialEvents     |
+		// +=================+=====================+=======================+
+		// | 0               | true/false          | nil/true/false        |
+		// +-----------------+---------------------+-----------------------+
+		{
+			name:                         "RV=0, allowWatchBookmarks=true, sendInitialEvents=nil",
+			opts:                         listOptions(true, nil, "0"),
+			expectedWatchResourceVersion: 0,
+		},
+		{
+			name:                         "RV=0, allowWatchBookmarks=true, sendInitialEvents=true",
+			opts:                         listOptions(true, ptr.To(true), "0"),
+			expectedWatchResourceVersion: 0,
+		},
+		{
+			name:                         "RV=0, allowWatchBookmarks=true, sendInitialEvents=false",
+			opts:                         listOptions(true, ptr.To(false), "0"),
+			expectedWatchResourceVersion: 0,
+		},
+		{
+			name:                         "RV=0, allowWatchBookmarks=false, sendInitialEvents=nil",
+			opts:                         listOptions(false, nil, "0"),
+			expectedWatchResourceVersion: 0,
+		},
+		{
+			name:                         "RV=0, allowWatchBookmarks=false, sendInitialEvents=true",
+			opts:                         listOptions(false, ptr.To(true), "0"),
+			expectedWatchResourceVersion: 0,
+		},
+		{
+			name:                         "RV=0, allowWatchBookmarks=false, sendInitialEvents=false",
+			opts:                         listOptions(false, ptr.To(false), "0"),
+			expectedWatchResourceVersion: 0,
+		},
+		// +-----------------+---------------------+-----------------------+
+		// | ResourceVersion | AllowWatchBookmarks | SendInitialEvents     |
+		// +=================+=====================+=======================+
+		// | 95             | true/false          | nil/true/false         |
+		// +-----------------+---------------------+-----------------------+
+		{
+			name:                         "RV=95, allowWatchBookmarks=true, sendInitialEvents=nil",
+			opts:                         listOptions(true, nil, "95"),
+			expectedWatchResourceVersion: 95,
+		},
+		{
+			name:                         "RV=95, allowWatchBookmarks=true, sendInitialEvents=true",
+			opts:                         listOptions(true, ptr.To(true), "95"),
+			expectedWatchResourceVersion: 95,
+		},
+		{
+			name:                         "RV=95, allowWatchBookmarks=true, sendInitialEvents=false",
+			opts:                         listOptions(true, ptr.To(false), "95"),
+			expectedWatchResourceVersion: 95,
+		},
+		{
+			name:                         "RV=95, allowWatchBookmarks=false, sendInitialEvents=nil",
+			opts:                         listOptions(false, nil, "95"),
+			expectedWatchResourceVersion: 95,
+		},
+		{
+			name:                         "RV=95, allowWatchBookmarks=false, sendInitialEvents=true",
+			opts:                         listOptions(false, ptr.To(true), "95"),
+			expectedWatchResourceVersion: 95,
+		},
+		{
+			name:                         "RV=95, allowWatchBookmarks=false, sendInitialEvents=false",
+			opts:                         listOptions(false, ptr.To(false), "95"),
+			expectedWatchResourceVersion: 95,
+		},
+	}
+
+	for _, scenario := range scenarios {
+		t.Run(scenario.name, func(t *testing.T) {
+			backingStorage := &dummyStorage{}
+			cacher, _, err := newTestCacher(backingStorage)
+			require.NoError(t, err, "couldn't create cacher")
+			defer cacher.Stop()
+
+			parsedResourceVersion := 0
+			if len(scenario.opts.ResourceVersion) > 0 {
+				parsedResourceVersion, err = strconv.Atoi(scenario.opts.ResourceVersion)
+				require.NoError(t, err)
+			}
+
+			actualResourceVersion, err := cacher.getWatchCacheResourceVersion(context.TODO(), uint64(parsedResourceVersion), scenario.opts)
+			require.NoError(t, err)
+			require.Equal(t, uint64(scenario.expectedWatchResourceVersion), actualResourceVersion, "received unexpected ResourceVersion")
+		})
+	}
+}
+
+// TestGetBookmarkAfterResourceVersionLockedFunc test the following cases:
+//
+// +-----------------+---------------------+-----------------------+
+// | ResourceVersion | AllowWatchBookmarks | SendInitialEvents     |
+// +=================+=====================+=======================+
+// | Unset           | true/false          | nil/true/false        |
+// | 0               | true/false          | nil/true/false        |
+// | 95             | true/false          | nil/true/false         |
+// +-----------------+---------------------+-----------------------+
+// where:
+// - false indicates the value of the param was set to "false" by a test case
+// - true  indicates the value of the param was set to "true" by a test case
+func TestGetBookmarkAfterResourceVersionLockedFunc(t *testing.T) {
+	listOptions := func(allowBookmarks bool, sendInitialEvents *bool, rv string) storage.ListOptions {
+		p := storage.Everything
+		p.AllowWatchBookmarks = allowBookmarks
+
+		opts := storage.ListOptions{}
+		opts.Predicate = p
+		opts.SendInitialEvents = sendInitialEvents
+		opts.ResourceVersion = rv
+		return opts
+	}
+
+	scenarios := []struct {
+		name                      string
+		opts                      storage.ListOptions
+		requiredResourceVersion   int
+		watchCacheResourceVersion int
+
+		expectedBookmarkResourceVersion int
+	}{
+		// +-----------------+---------------------+-----------------------+
+		// | ResourceVersion | AllowWatchBookmarks | SendInitialEvents     |
+		// +=================+=====================+=======================+
+		// | Unset           | true/false          | nil/true/false        |
+		// +-----------------+---------------------+-----------------------+
+		{
+			name:                            "RV=unset, allowWatchBookmarks=true, sendInitialEvents=nil",
+			opts:                            listOptions(true, nil, ""),
+			requiredResourceVersion:         100,
+			watchCacheResourceVersion:       99,
+			expectedBookmarkResourceVersion: 0,
+		},
+		{
+			name:                            "RV=unset, allowWatchBookmarks=true, sendInitialEvents=true",
+			opts:                            listOptions(true, ptr.To(true), ""),
+			requiredResourceVersion:         100,
+			watchCacheResourceVersion:       99,
+			expectedBookmarkResourceVersion: 100,
+		},
+		{
+			name:                            "RV=unset, allowWatchBookmarks=true, sendInitialEvents=false",
+			opts:                            listOptions(true, ptr.To(false), ""),
+			requiredResourceVersion:         100,
+			watchCacheResourceVersion:       99,
+			expectedBookmarkResourceVersion: 0,
+		},
+		{
+			name:                            "RV=unset, allowWatchBookmarks=false, sendInitialEvents=nil",
+			opts:                            listOptions(false, nil, ""),
+			requiredResourceVersion:         100,
+			watchCacheResourceVersion:       99,
+			expectedBookmarkResourceVersion: 0,
+		},
+		{
+			name:                            "RV=unset, allowWatchBookmarks=false, sendInitialEvents=true",
+			opts:                            listOptions(false, ptr.To(true), ""),
+			requiredResourceVersion:         100,
+			watchCacheResourceVersion:       99,
+			expectedBookmarkResourceVersion: 0,
+		},
+		{
+			name:                            "RV=unset, allowWatchBookmarks=false, sendInitialEvents=false",
+			opts:                            listOptions(false, ptr.To(false), ""),
+			requiredResourceVersion:         100,
+			watchCacheResourceVersion:       99,
+			expectedBookmarkResourceVersion: 0,
+		},
+		// +-----------------+---------------------+-----------------------+
+		// | ResourceVersion | AllowWatchBookmarks | SendInitialEvents     |
+		// +=================+=====================+=======================+
+		// | 0               | true/false          | nil/true/false        |
+		// +-----------------+---------------------+-----------------------+
+		{
+			name:                            "RV=0, allowWatchBookmarks=true, sendInitialEvents=nil",
+			opts:                            listOptions(true, nil, "0"),
+			requiredResourceVersion:         0,
+			watchCacheResourceVersion:       99,
+			expectedBookmarkResourceVersion: 0,
+		},
+		{
+			name:                            "RV=0, allowWatchBookmarks=true, sendInitialEvents=true",
+			opts:                            listOptions(true, ptr.To(true), "0"),
+			requiredResourceVersion:         0,
+			watchCacheResourceVersion:       99,
+			expectedBookmarkResourceVersion: 99,
+		},
+		{
+			name:                            "RV=0, allowWatchBookmarks=true, sendInitialEvents=false",
+			opts:                            listOptions(true, ptr.To(false), "0"),
+			requiredResourceVersion:         0,
+			watchCacheResourceVersion:       99,
+			expectedBookmarkResourceVersion: 0,
+		},
+		{
+			name:                            "RV=0, allowWatchBookmarks=false, sendInitialEvents=nil",
+			opts:                            listOptions(false, nil, "0"),
+			requiredResourceVersion:         0,
+			watchCacheResourceVersion:       99,
+			expectedBookmarkResourceVersion: 0,
+		},
+		{
+			name:                            "RV=0, allowWatchBookmarks=false, sendInitialEvents=true",
+			opts:                            listOptions(false, ptr.To(true), "0"),
+			requiredResourceVersion:         0,
+			watchCacheResourceVersion:       99,
+			expectedBookmarkResourceVersion: 0,
+		},
+		{
+			name:                            "RV=0, allowWatchBookmarks=false, sendInitialEvents=false",
+			opts:                            listOptions(false, ptr.To(false), "0"),
+			requiredResourceVersion:         0,
+			watchCacheResourceVersion:       99,
+			expectedBookmarkResourceVersion: 0,
+		},
+		// +-----------------+---------------------+-----------------------+
+		// | ResourceVersion | AllowWatchBookmarks | SendInitialEvents     |
+		// +=================+=====================+=======================+
+		// | 95             | true/false          | nil/true/false         |
+		// +-----------------+---------------------+-----------------------+
+		{
+			name:                            "RV=95, allowWatchBookmarks=true, sendInitialEvents=nil",
+			opts:                            listOptions(true, nil, "95"),
+			requiredResourceVersion:         0,
+			watchCacheResourceVersion:       99,
+			expectedBookmarkResourceVersion: 0,
+		},
+		{
+			name:                            "RV=95, allowWatchBookmarks=true, sendInitialEvents=true",
+			opts:                            listOptions(true, ptr.To(true), "95"),
+			requiredResourceVersion:         0,
+			watchCacheResourceVersion:       99,
+			expectedBookmarkResourceVersion: 95,
+		},
+		{
+			name:                            "RV=95, allowWatchBookmarks=true, sendInitialEvents=false",
+			opts:                            listOptions(true, ptr.To(false), "95"),
+			requiredResourceVersion:         0,
+			watchCacheResourceVersion:       99,
+			expectedBookmarkResourceVersion: 0,
+		},
+		{
+			name:                            "RV=95, allowWatchBookmarks=false, sendInitialEvents=nil",
+			opts:                            listOptions(false, nil, "95"),
+			requiredResourceVersion:         100,
+			watchCacheResourceVersion:       99,
+			expectedBookmarkResourceVersion: 0,
+		},
+		{
+			name:                            "RV=95, allowWatchBookmarks=false, sendInitialEvents=true",
+			opts:                            listOptions(false, ptr.To(true), "95"),
+			requiredResourceVersion:         0,
+			watchCacheResourceVersion:       99,
+			expectedBookmarkResourceVersion: 0,
+		},
+		{
+			name:                            "RV=95, allowWatchBookmarks=false, sendInitialEvents=false",
+			opts:                            listOptions(false, ptr.To(false), "95"),
+			requiredResourceVersion:         0,
+			watchCacheResourceVersion:       99,
+			expectedBookmarkResourceVersion: 0,
+		},
+	}
+	for _, scenario := range scenarios {
+		t.Run(scenario.name, func(t *testing.T) {
+			backingStorage := &dummyStorage{}
+			cacher, _, err := newTestCacher(backingStorage)
+			require.NoError(t, err, "couldn't create cacher")
+
+			defer cacher.Stop()
+
+			if !utilfeature.DefaultFeatureGate.Enabled(features.ResilientWatchCacheInitialization) {
+				if err := cacher.ready.wait(context.Background()); err != nil {
+					t.Fatalf("unexpected error waiting for the cache to be ready")
+				}
+			}
+
+			cacher.watchCache.UpdateResourceVersion(fmt.Sprintf("%d", scenario.watchCacheResourceVersion))
+			parsedResourceVersion := 0
+			if len(scenario.opts.ResourceVersion) > 0 {
+				parsedResourceVersion, err = strconv.Atoi(scenario.opts.ResourceVersion)
+				require.NoError(t, err)
+			}
+
+			getBookMarkFn, err := cacher.getBookmarkAfterResourceVersionLockedFunc(uint64(parsedResourceVersion), uint64(scenario.requiredResourceVersion), scenario.opts)
+			require.NoError(t, err)
+			cacher.watchCache.RLock()
+			defer cacher.watchCache.RUnlock()
+			getBookMarkResourceVersion := getBookMarkFn()
+			require.Equal(t, uint64(scenario.expectedBookmarkResourceVersion), getBookMarkResourceVersion, "received unexpected ResourceVersion")
+		})
+	}
+}
+
+func TestWatchStreamSeparation(t *testing.T) {
+	server, etcdStorage := newEtcdTestStorage(t, etcd3testing.PathPrefix())
+	t.Cleanup(func() {
+		server.Terminate(t)
+	})
+	setupOpts := &setupOptions{}
+	withDefaults(setupOpts)
+	config := Config{
+		Storage:             etcdStorage,
+		Versioner:           storage.APIObjectVersioner{},
+		GroupResource:       schema.GroupResource{Resource: "pods"},
+		EventsHistoryWindow: DefaultEventFreshDuration,
+		ResourcePrefix:      setupOpts.resourcePrefix,
+		KeyFunc:             setupOpts.keyFunc,
+		GetAttrsFunc:        GetPodAttrs,
+		NewFunc:             newPod,
+		NewListFunc:         newPodList,
+		IndexerFuncs:        setupOpts.indexerFuncs,
+		Codec:               codecs.LegacyCodec(examplev1.SchemeGroupVersion),
+		Clock:               setupOpts.clock,
+	}
+	tcs := []struct {
+		name                         string
+		separateCacheWatchRPC        bool
+		useWatchCacheContextMetadata bool
+		expectBookmarkOnWatchCache   bool
+		expectBookmarkOnEtcd         bool
+	}{
+		{
+			name:                       "common RPC > both get bookmarks",
+			separateCacheWatchRPC:      false,
+			expectBookmarkOnEtcd:       true,
+			expectBookmarkOnWatchCache: true,
+		},
+		{
+			name:                       "separate RPC > only etcd gets bookmarks",
+			separateCacheWatchRPC:      true,
+			expectBookmarkOnEtcd:       true,
+			expectBookmarkOnWatchCache: false,
+		},
+		{
+			name:                         "separate RPC & watch cache context > only watch cache gets bookmarks",
+			separateCacheWatchRPC:        true,
+			useWatchCacheContextMetadata: true,
+			expectBookmarkOnEtcd:         false,
+			expectBookmarkOnWatchCache:   true,
+		},
+	}
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.SeparateCacheWatchRPC, tc.separateCacheWatchRPC)
+			cacher, err := NewCacherFromConfig(config)
+			if err != nil {
+				t.Fatalf("Failed to initialize cacher: %v", err)
+			}
+			defer cacher.Stop()
+
+			if !utilfeature.DefaultFeatureGate.Enabled(features.ResilientWatchCacheInitialization) {
+				if err := cacher.ready.wait(context.TODO()); err != nil {
+					t.Fatalf("unexpected error waiting for the cache to be ready")
+				}
+			}
+
+			getCacherRV := func() uint64 {
+				cacher.watchCache.RLock()
+				defer cacher.watchCache.RUnlock()
+				return cacher.watchCache.resourceVersion
+			}
+			waitContext, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			waitForEtcdBookmark := watchAndWaitForBookmark(t, waitContext, cacher.storage)
+
+			var out example.Pod
+			err = cacher.storage.Create(context.Background(), "foo", &example.Pod{}, &out, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = cacher.storage.Delete(context.Background(), "foo", &out, nil, storage.ValidateAllObjectFunc, &example.Pod{}, storage.DeleteOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			versioner := storage.APIObjectVersioner{}
+			var lastResourceVersion uint64
+			lastResourceVersion, err = versioner.ObjectResourceVersion(&out)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var contextMetadata metadata.MD
+			if tc.useWatchCacheContextMetadata {
+				contextMetadata = metadata.New(map[string]string{"source": "cache"})
+			}
+			// For the first 100ms from watch creation, watch progress requests are ignored.
+			time.Sleep(200 * time.Millisecond)
+			err = cacher.storage.RequestWatchProgress(metadata.NewOutgoingContext(context.Background(), contextMetadata))
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Give time for bookmark to arrive
+			time.Sleep(time.Second)
+
+			etcdWatchResourceVersion := waitForEtcdBookmark()
+			gotEtcdWatchBookmark := etcdWatchResourceVersion == lastResourceVersion
+			if gotEtcdWatchBookmark != tc.expectBookmarkOnEtcd {
+				t.Errorf("Unexpected etcd bookmark check result, rv: %d, lastRV: %d, wantMatching: %v", etcdWatchResourceVersion, lastResourceVersion, tc.expectBookmarkOnEtcd)
+			}
+
+			watchCacheResourceVersion := getCacherRV()
+			cacherGotBookmark := watchCacheResourceVersion == lastResourceVersion
+			if cacherGotBookmark != tc.expectBookmarkOnWatchCache {
+				t.Errorf("Unexpected watch cache bookmark check result, rv: %d, lastRV: %d, wantMatching: %v", watchCacheResourceVersion, lastResourceVersion, tc.expectBookmarkOnWatchCache)
+			}
+		})
+	}
+}
+
+func TestComputeListLimit(t *testing.T) {
+	scenarios := []struct {
+		name          string
+		opts          storage.ListOptions
+		expectedLimit int64
+	}{
+		{
+			name: "limit is zero",
+			opts: storage.ListOptions{
+				Predicate: storage.SelectionPredicate{
+					Limit: 0,
+				},
+			},
+			expectedLimit: 0,
+		},
+		{
+			name: "limit is positive, RV is unset",
+			opts: storage.ListOptions{
+				Predicate: storage.SelectionPredicate{
+					Limit: 1,
+				},
+				ResourceVersion: "",
+			},
+			expectedLimit: 1,
+		},
+		{
+			name: "limit is positive, RV = 100",
+			opts: storage.ListOptions{
+				Predicate: storage.SelectionPredicate{
+					Limit: 1,
+				},
+				ResourceVersion: "100",
+			},
+			expectedLimit: 1,
+		},
+		{
+			name: "legacy case: limit is positive, RV = 0",
+			opts: storage.ListOptions{
+				Predicate: storage.SelectionPredicate{
+					Limit: 1,
+				},
+				ResourceVersion: "0",
+			},
+			expectedLimit: 0,
+		},
+	}
+
+	for _, scenario := range scenarios {
+		t.Run(scenario.name, func(t *testing.T) {
+			actualLimit := computeListLimit(scenario.opts)
+			if actualLimit != scenario.expectedLimit {
+				t.Errorf("computeListLimit returned = %v, expected %v", actualLimit, scenario.expectedLimit)
+			}
+		})
+	}
+}
+
+func watchAndWaitForBookmark(t *testing.T, ctx context.Context, etcdStorage storage.Interface) func() (resourceVersion uint64) {
+	opts := storage.ListOptions{ResourceVersion: "", Predicate: storage.Everything, Recursive: true}
+	opts.Predicate.AllowWatchBookmarks = true
+	w, err := etcdStorage.Watch(ctx, "/pods/", opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	versioner := storage.APIObjectVersioner{}
+	var rv uint64
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for event := range w.ResultChan() {
+			if event.Type == watch.Bookmark {
+				rv, err = versioner.ObjectResourceVersion(event.Object)
+				break
+			}
+		}
+	}()
+	return func() (resourceVersion uint64) {
+		defer w.Stop()
+		wg.Wait()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rv
+	}
+}
+
+// TODO(p0lyn0mial): forceRequestWatchProgressSupport inits the storage layer
+// so that tests that require storage.RequestWatchProgress pass
+//
+// In the future we could have a function that would allow for setting the feature
+// only for duration of a test.
+func forceRequestWatchProgressSupport(t *testing.T) {
+	if etcdfeature.DefaultFeatureSupportChecker.Supports(storage.RequestWatchProgress) {
+		return
+	}
+
+	server, _ := newEtcdTestStorage(t, etcd3testing.PathPrefix())
+	defer server.Terminate(t)
+	if err := wait.PollUntilContextTimeout(context.Background(), 100*time.Millisecond, wait.ForeverTestTimeout, true, func(_ context.Context) (bool, error) {
+		return etcdfeature.DefaultFeatureSupportChecker.Supports(storage.RequestWatchProgress), nil
+	}); err != nil {
+		t.Fatalf("failed to wait for required %v storage feature to initialize", storage.RequestWatchProgress)
+	}
+}
+
+func TestListIndexer(t *testing.T) {
+	ctx, cacher, terminate := testSetup(t, withNodeNameAndNamespaceIndex)
+	t.Cleanup(terminate)
+	tests := []struct {
+		name               string
+		requestedNamespace string
+		recursive          bool
+		fieldSelector      fields.Selector
+		indexFields        []string
+		expectIndex        string
+	}{
+		{
+			name:          "request without namespace, without field selector",
+			recursive:     true,
+			fieldSelector: fields.Everything(),
+		},
+		{
+			name:          "request without namespace, field selector with metadata.namespace",
+			recursive:     true,
+			fieldSelector: fields.ParseSelectorOrDie("metadata.namespace=namespace"),
+		},
+		{
+			name:          "request without namespace, field selector with spec.nodename",
+			recursive:     true,
+			fieldSelector: fields.ParseSelectorOrDie("spec.nodeName=node"),
+			indexFields:   []string{"spec.nodeName"},
+			expectIndex:   "f:spec.nodeName",
+		},
+		{
+			name:          "request without namespace, field selector with spec.nodename to filter out",
+			recursive:     true,
+			fieldSelector: fields.ParseSelectorOrDie("spec.nodeName!=node"),
+			indexFields:   []string{"spec.nodeName"},
+		},
+		{
+			name:               "request with namespace, without field selector",
+			requestedNamespace: "namespace",
+			recursive:          true,
+			fieldSelector:      fields.Everything(),
+		},
+		{
+			name:               "request with namespace, field selector with matched metadata.namespace",
+			requestedNamespace: "namespace",
+			recursive:          true,
+			fieldSelector:      fields.ParseSelectorOrDie("metadata.namespace=namespace"),
+		},
+		{
+			name:               "request with namespace, field selector with non-matched metadata.namespace",
+			requestedNamespace: "namespace",
+			recursive:          true,
+			fieldSelector:      fields.ParseSelectorOrDie("metadata.namespace=namespace"),
+		},
+		{
+			name:               "request with namespace, field selector with spec.nodename",
+			requestedNamespace: "namespace",
+			recursive:          true,
+			fieldSelector:      fields.ParseSelectorOrDie("spec.nodeName=node"),
+			indexFields:        []string{"spec.nodeName"},
+			expectIndex:        "f:spec.nodeName",
+		},
+		{
+			name:               "request with namespace, field selector with spec.nodename to filter out",
+			requestedNamespace: "namespace",
+			recursive:          true,
+			fieldSelector:      fields.ParseSelectorOrDie("spec.nodeName!=node"),
+			indexFields:        []string{"spec.nodeName"},
+		},
+		{
+			name:          "request without namespace, field selector with metadata.name",
+			recursive:     true,
+			fieldSelector: fields.ParseSelectorOrDie("metadata.name=name"),
+		},
+		{
+			name:      "request without namespace, field selector with metadata.name and metadata.namespace",
+			recursive: true,
+			fieldSelector: fields.SelectorFromSet(fields.Set{
+				"metadata.name":      "name",
+				"metadata.namespace": "namespace",
+			}),
+		},
+		{
+			name:      "request without namespace, field selector with metadata.name and spec.nodeName",
+			recursive: true,
+			fieldSelector: fields.SelectorFromSet(fields.Set{
+				"metadata.name": "name",
+				"spec.nodeName": "node",
+			}),
+			indexFields: []string{"spec.nodeName"},
+			expectIndex: "f:spec.nodeName",
+		},
+		{
+			name:      "request without namespace, field selector with metadata.name, and with spec.nodeName to filter out watch",
+			recursive: true,
+			fieldSelector: fields.AndSelectors(
+				fields.ParseSelectorOrDie("spec.nodeName!=node"),
+				fields.SelectorFromSet(fields.Set{"metadata.name": "name"}),
+			),
+			indexFields: []string{"spec.nodeName"},
+		},
+		{
+			name:               "request with namespace, with field selector metadata.name",
+			requestedNamespace: "namespace",
+			fieldSelector:      fields.ParseSelectorOrDie("metadata.name=name"),
+		},
+		{
+			name:               "request with namespace, with field selector metadata.name and metadata.namespace",
+			requestedNamespace: "namespace",
+			fieldSelector: fields.SelectorFromSet(fields.Set{
+				"metadata.name":      "name",
+				"metadata.namespace": "namespace",
+			}),
+		},
+		{
+			name:               "request with namespace, with field selector metadata.name, metadata.namespace and spec.nodename",
+			requestedNamespace: "namespace",
+			fieldSelector: fields.SelectorFromSet(fields.Set{
+				"metadata.name":      "name",
+				"metadata.namespace": "namespace",
+				"spec.nodeName":      "node",
+			}),
+			indexFields: []string{"spec.nodeName"},
+		},
+		{
+			name:               "request with namespace, with field selector metadata.name, metadata.namespace, and with spec.nodename to filter out",
+			requestedNamespace: "namespace",
+			fieldSelector: fields.AndSelectors(
+				fields.ParseSelectorOrDie("spec.nodeName!=node"),
+				fields.SelectorFromSet(fields.Set{"metadata.name": "name", "metadata.namespace": "namespace"}),
+			),
+			indexFields: []string{"spec.nodeName"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pred := storagetesting.CreatePodPredicate(tt.fieldSelector, true, tt.indexFields)
+			_, usedIndex, err := cacher.cacher.watchCache.WaitUntilFreshAndGetList(ctx, "/pods/"+tt.requestedNamespace, storage.ListOptions{Predicate: pred, Recursive: tt.recursive})
+			if err != nil {
+				t.Errorf("Unexpected error: %v", err)
+			}
+			if usedIndex != tt.expectIndex {
+				t.Errorf("Index doesn't match, expected: %q, got: %q", tt.expectIndex, usedIndex)
+			}
+		})
+	}
+}
+
+func TestRetryAfterForUnreadyCache(t *testing.T) {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.ResilientWatchCacheInitialization) {
+		t.Skipf("the test requires %v to be enabled", features.ResilientWatchCacheInitialization)
+	}
+	backingStorage := &dummyStorage{}
+	clock := testingclock.NewFakeClock(time.Now())
+	cacher, _, err := newTestCacherWithoutSyncing(backingStorage, clock)
+	if err != nil {
+		t.Fatalf("Couldn't create cacher: %v", err)
+	}
+	defer cacher.Stop()
+	if err = cacher.ready.wait(context.Background()); err != nil {
+		t.Fatalf("Unexpected error waiting for the cache to be ready")
+	}
+
+	cacher.ready.setError(nil)
+	clock.Step(14 * time.Second)
+
+	opts := storage.ListOptions{
+		ResourceVersion: "0",
+		Predicate:       storage.Everything,
+	}
+	result := &example.PodList{}
+	delegator := NewCacheDelegator(cacher, backingStorage)
+	defer delegator.Stop()
+	err = delegator.GetList(context.TODO(), "/pods/ns", opts, result)
+
+	if !apierrors.IsTooManyRequests(err) {
+		t.Fatalf("Unexpected GetList error: %v", err)
+	}
+	var statusError apierrors.APIStatus
+	if !errors.As(err, &statusError) {
+		t.Fatalf("Unexpected error: %v, expected apierrors.APIStatus", err)
+	}
+	if statusError.Status().Details == nil {
+		t.Fatalf("Expected to get status details, got none")
+	}
+	if statusError.Status().Details.RetryAfterSeconds != 2 {
+		t.Fatalf("Unexpected retry after: %v", statusError.Status().Details.RetryAfterSeconds)
+	}
 }

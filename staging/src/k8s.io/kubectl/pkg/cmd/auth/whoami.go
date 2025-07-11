@@ -32,6 +32,7 @@ import (
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/cli-runtime/pkg/genericiooptions"
 	"k8s.io/cli-runtime/pkg/printers"
+	authenticationv1client "k8s.io/client-go/kubernetes/typed/authentication/v1"
 	authenticationv1alpha1client "k8s.io/client-go/kubernetes/typed/authentication/v1alpha1"
 	authenticationv1beta1client "k8s.io/client-go/kubernetes/typed/authentication/v1beta1"
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
@@ -85,6 +86,11 @@ func (flags *WhoAmIFlags) ToOptions(ctx context.Context, args []string) (*WhoAmI
 		return nil, err
 	}
 
+	w.authV1Client, err = authenticationv1client.NewForConfig(clientConfig)
+	if err != nil {
+		return nil, err
+	}
+
 	if !flags.PrintFlags.OutputFlagSpecified() {
 		w.resourcePrinterFunc = printTableSelfSubjectAccessReview
 	} else {
@@ -103,6 +109,7 @@ func (flags *WhoAmIFlags) ToOptions(ctx context.Context, args []string) (*WhoAmI
 type WhoAmIOptions struct {
 	authV1alpha1Client authenticationv1alpha1client.AuthenticationV1alpha1Interface
 	authV1beta1Client  authenticationv1beta1client.AuthenticationV1beta1Interface
+	authV1Client       authenticationv1client.AuthenticationV1Interface
 
 	ctx context.Context
 
@@ -115,16 +122,16 @@ var (
 	whoAmILong = templates.LongDesc(`
 		Experimental: Check who you are and your attributes (groups, extra).
 
-        This command is helpful to get yourself aware of the current user attributes, 
-        especially when dynamic authentication, e.g., token webhook, auth proxy, or OIDC provider, 
+        This command is helpful to get yourself aware of the current user attributes,
+        especially when dynamic authentication, e.g., token webhook, auth proxy, or OIDC provider,
         is enabled in the Kubernetes cluster.
 	`)
 
 	whoAmIExample = templates.Examples(`
-		# Get your subject attributes.
+		# Get your subject attributes
 		kubectl auth whoami
-		
-		# Get your subject attributes in JSON format.
+
+		# Get your subject attributes in JSON format
 		kubectl auth whoami -o json
 	`)
 )
@@ -166,14 +173,20 @@ func (o WhoAmIOptions) Run() error {
 		err error
 	)
 
-	res, err = o.authV1beta1Client.
+	res, err = o.authV1Client.
 		SelfSubjectReviews().
-		Create(context.TODO(), &authenticationv1beta1.SelfSubjectReview{}, metav1.CreateOptions{})
+		Create(context.TODO(), &authenticationv1.SelfSubjectReview{}, metav1.CreateOptions{})
 	if err != nil && errors.IsNotFound(err) {
-		// Fallback to Alpha API if Beta is not enabled
-		res, err = o.authV1alpha1Client.
+		// Fallback to Beta API if Beta is not enabled
+		res, err = o.authV1beta1Client.
 			SelfSubjectReviews().
-			Create(context.TODO(), &authenticationv1alpha1.SelfSubjectReview{}, metav1.CreateOptions{})
+			Create(context.TODO(), &authenticationv1beta1.SelfSubjectReview{}, metav1.CreateOptions{})
+		if err != nil && errors.IsNotFound(err) {
+			// Fallback to Alpha API if Beta is not enabled
+			res, err = o.authV1alpha1Client.
+				SelfSubjectReviews().
+				Create(context.TODO(), &authenticationv1alpha1.SelfSubjectReview{}, metav1.CreateOptions{})
+		}
 	}
 	if err != nil {
 		switch {
@@ -194,6 +207,8 @@ func getUserInfo(obj runtime.Object) (authenticationv1.UserInfo, error) {
 		return obj.(*authenticationv1alpha1.SelfSubjectReview).Status.UserInfo, nil
 	case *authenticationv1beta1.SelfSubjectReview:
 		return obj.(*authenticationv1beta1.SelfSubjectReview).Status.UserInfo, nil
+	case *authenticationv1.SelfSubjectReview:
+		return obj.(*authenticationv1.SelfSubjectReview).Status.UserInfo, nil
 	default:
 		return authenticationv1.UserInfo{}, fmt.Errorf("unexpected response type %T, expected SelfSubjectReview", obj)
 	}
@@ -235,7 +250,7 @@ func printTableSelfSubjectAccessReview(obj runtime.Object, out io.Writer) error 
 	}
 
 	if len(ui.Extra) > 0 {
-		for _, k := range sets.StringKeySet(ui.Extra).List() {
+		for _, k := range sets.List(sets.KeySet(ui.Extra)) {
 			v := ui.Extra[k]
 			_, err := fmt.Fprintf(w, "Extra: %s\t%v\n", k, v)
 			if err != nil {

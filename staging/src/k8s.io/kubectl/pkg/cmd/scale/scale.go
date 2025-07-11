@@ -58,7 +58,7 @@ var (
 		kubectl scale --current-replicas=2 --replicas=3 deployment/mysql
 
 		# Scale multiple replication controllers
-		kubectl scale --replicas=5 rc/foo rc/bar rc/baz
+		kubectl scale --replicas=5 rc/example1 rc/example2 rc/example3
 
 		# Scale stateful set named 'web' to 3
 		kubectl scale --replicas=3 statefulset/web`))
@@ -229,6 +229,9 @@ func (o *ScaleOptions) RunScale() error {
 	}
 
 	if len(infos) == 0 {
+		if infoErr != nil {
+			return fmt.Errorf("no objects passed to scale %w", infoErr)
+		}
 		return fmt.Errorf("no objects passed to scale")
 	}
 

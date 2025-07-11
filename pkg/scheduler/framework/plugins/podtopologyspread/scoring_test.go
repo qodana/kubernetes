@@ -21,6 +21,7 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -29,17 +30,87 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/klog/v2/ktesting"
 	"k8s.io/kubernetes/pkg/scheduler/apis/config"
+	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
 	plugintesting "k8s.io/kubernetes/pkg/scheduler/framework/plugins/testing"
 	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
-	"k8s.io/kubernetes/pkg/scheduler/internal/cache"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
-	"k8s.io/utils/pointer"
+	tf "k8s.io/kubernetes/pkg/scheduler/testing/framework"
+	"k8s.io/utils/ptr"
 )
 
 var podTopologySpreadFunc = frameworkruntime.FactoryAdapter(feature.Features{}, New)
+
+// TestPreScoreSkip tests the cases that TopologySpread#PreScore returns the Skip status.
+func TestPreScoreSkip(t *testing.T) {
+	tests := []struct {
+		name   string
+		pod    *v1.Pod
+		nodes  []*v1.Node
+		objs   []runtime.Object
+		config config.PodTopologySpreadArgs
+	}{
+		{
+			name: "the pod doesn't have soft topology spread Constraints",
+			pod:  st.MakePod().Name("p").Namespace("default").Obj(),
+			config: config.PodTopologySpreadArgs{
+				DefaultingType: config.ListDefaulting,
+			},
+			nodes: []*v1.Node{
+				st.MakeNode().Name("node-a").Label(v1.LabelHostname, "node-a").Obj(),
+				st.MakeNode().Name("node-b").Label(v1.LabelHostname, "node-b").Obj(),
+			},
+		},
+		{
+			name: "default constraints and a replicaset that doesn't match",
+			pod:  st.MakePod().Name("p").Namespace("default").Label("foo", "bar").Label("baz", "sup").OwnerReference("rs2", appsv1.SchemeGroupVersion.WithKind("ReplicaSet")).Obj(),
+			config: config.PodTopologySpreadArgs{
+				DefaultConstraints: []v1.TopologySpreadConstraint{
+					{
+						MaxSkew:           2,
+						TopologyKey:       "planet",
+						WhenUnsatisfiable: v1.ScheduleAnyway,
+					},
+				},
+				DefaultingType: config.ListDefaulting,
+			},
+			nodes: []*v1.Node{
+				st.MakeNode().Name("node-a").Label("planet", "mars").Obj(),
+			},
+			objs: []runtime.Object{
+				&appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "rs1"}, Spec: appsv1.ReplicaSetSpec{Selector: st.MakeLabelSelector().Exists("tar").Obj()}},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ctx := ktesting.NewTestContext(t)
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			informerFactory := informers.NewSharedInformerFactory(fake.NewClientset(tt.objs...), 0)
+			f, err := frameworkruntime.NewFramework(ctx, nil, nil,
+				frameworkruntime.WithSnapshotSharedLister(cache.NewSnapshot(nil, tt.nodes)),
+				frameworkruntime.WithInformerFactory(informerFactory))
+			if err != nil {
+				t.Fatalf("Failed creating framework runtime: %v", err)
+			}
+			pl, err := New(ctx, &tt.config, f, feature.Features{})
+			if err != nil {
+				t.Fatalf("Failed creating plugin: %v", err)
+			}
+			informerFactory.Start(ctx.Done())
+			informerFactory.WaitForCacheSync(ctx.Done())
+			p := pl.(*PodTopologySpread)
+			cs := framework.NewCycleState()
+			if s := p.PreScore(ctx, cs, tt.pod, tf.BuildNodeInfos(tt.nodes)); !s.IsSkip() {
+				t.Fatalf("Expected skip but got %v", s.AsError())
+			}
+		})
+	}
+}
 
 func TestPreScoreStateEmptyNodes(t *testing.T) {
 	tests := []struct {
@@ -85,9 +156,12 @@ func TestPreScoreStateEmptyNodes(t *testing.T) {
 					},
 				},
 				IgnoredNodes: sets.New[string](),
-				TopologyPairToPodCounts: map[topologyPair]*int64{
-					{key: "zone", value: "zone1"}: pointer.Int64(0),
-					{key: "zone", value: "zone2"}: pointer.Int64(0),
+				TopologyValueToPodCounts: []map[string]*int64{
+					{
+						"zone1": ptr.To[int64](0),
+						"zone2": ptr.To[int64](0),
+					},
+					{},
 				},
 				TopologyNormalizingWeight: []float64{topologyNormalizingWeight(2), topologyNormalizingWeight(3)},
 			},
@@ -117,10 +191,10 @@ func TestPreScoreStateEmptyNodes(t *testing.T) {
 					},
 				},
 				IgnoredNodes: sets.New[string](),
-				TopologyPairToPodCounts: map[topologyPair]*int64{
-					{key: "zone", value: "zone1"}: pointer.Int64(0),
-					{key: "zone", value: "zone2"}: pointer.Int64(0),
-				},
+				TopologyValueToPodCounts: []map[string]*int64{{
+					"zone1": ptr.To[int64](0),
+					"zone2": ptr.To[int64](0),
+				}},
 				TopologyNormalizingWeight: []float64{topologyNormalizingWeight(2)},
 			},
 		},
@@ -158,8 +232,11 @@ func TestPreScoreStateEmptyNodes(t *testing.T) {
 					},
 				},
 				IgnoredNodes: sets.New("node-x"),
-				TopologyPairToPodCounts: map[topologyPair]*int64{
-					{key: "zone", value: "zone1"}: pointer.Int64(0),
+				TopologyValueToPodCounts: []map[string]*int64{
+					{
+						"zone1": ptr.To[int64](0),
+					},
+					{},
 				},
 				TopologyNormalizingWeight: []float64{topologyNormalizingWeight(1), topologyNormalizingWeight(2)},
 			},
@@ -200,9 +277,12 @@ func TestPreScoreStateEmptyNodes(t *testing.T) {
 					},
 				},
 				IgnoredNodes: sets.New[string](),
-				TopologyPairToPodCounts: map[topologyPair]*int64{
-					{key: v1.LabelTopologyZone, value: "mars"}: pointer.Int64(0),
-					{key: v1.LabelTopologyZone, value: ""}:     pointer.Int64(0),
+				TopologyValueToPodCounts: []map[string]*int64{
+					{},
+					{
+						"mars": ptr.To[int64](0),
+						"":     ptr.To[int64](0),
+					},
 				},
 				TopologyNormalizingWeight: []float64{topologyNormalizingWeight(4), topologyNormalizingWeight(2)},
 			},
@@ -251,33 +331,13 @@ func TestPreScoreStateEmptyNodes(t *testing.T) {
 					},
 				},
 				IgnoredNodes: sets.New[string](),
-				TopologyPairToPodCounts: map[topologyPair]*int64{
-					{key: "planet", value: "mars"}: pointer.Int64(0),
-				},
-				TopologyNormalizingWeight: []float64{topologyNormalizingWeight(1), topologyNormalizingWeight(1)},
-			},
-		},
-		{
-			name: "default constraints and a replicaset that doesn't match",
-			pod:  st.MakePod().Name("p").Namespace("default").Label("foo", "bar").Label("baz", "sup").OwnerReference("rs2", appsv1.SchemeGroupVersion.WithKind("ReplicaSet")).Obj(),
-			config: config.PodTopologySpreadArgs{
-				DefaultConstraints: []v1.TopologySpreadConstraint{
+				TopologyValueToPodCounts: []map[string]*int64{
+					{},
 					{
-						MaxSkew:           2,
-						TopologyKey:       "planet",
-						WhenUnsatisfiable: v1.ScheduleAnyway,
+						"mars": ptr.To[int64](0),
 					},
 				},
-				DefaultingType: config.ListDefaulting,
-			},
-			nodes: []*v1.Node{
-				st.MakeNode().Name("node-a").Label("planet", "mars").Obj(),
-			},
-			objs: []runtime.Object{
-				&appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "rs1"}, Spec: appsv1.ReplicaSetSpec{Selector: st.MakeLabelSelector().Exists("tar").Obj()}},
-			},
-			want: &preScoreState{
-				TopologyPairToPodCounts: make(map[topologyPair]*int64),
+				TopologyNormalizingWeight: []float64{topologyNormalizingWeight(1), topologyNormalizingWeight(1)},
 			},
 		},
 		{
@@ -315,9 +375,9 @@ func TestPreScoreStateEmptyNodes(t *testing.T) {
 					},
 				},
 				IgnoredNodes: sets.New[string](),
-				TopologyPairToPodCounts: map[topologyPair]*int64{
-					{"planet", "mars"}: pointer.Int64(0),
-				},
+				TopologyValueToPodCounts: []map[string]*int64{{
+					"mars": ptr.To[int64](0),
+				}},
 				TopologyNormalizingWeight: []float64{topologyNormalizingWeight(1)},
 			},
 		},
@@ -347,10 +407,10 @@ func TestPreScoreStateEmptyNodes(t *testing.T) {
 					},
 				},
 				IgnoredNodes: sets.New[string](),
-				TopologyPairToPodCounts: map[topologyPair]*int64{
-					{key: "zone", value: "zone1"}: pointer.Int64(0),
-					{key: "zone", value: "zone2"}: pointer.Int64(0),
-				},
+				TopologyValueToPodCounts: []map[string]*int64{{
+					"zone1": ptr.To[int64](0),
+					"zone2": ptr.To[int64](0),
+				}},
 				TopologyNormalizingWeight: []float64{topologyNormalizingWeight(2)},
 			},
 			enableNodeInclusionPolicy: true,
@@ -381,10 +441,10 @@ func TestPreScoreStateEmptyNodes(t *testing.T) {
 					},
 				},
 				IgnoredNodes: sets.New[string](),
-				TopologyPairToPodCounts: map[topologyPair]*int64{
-					{key: "zone", value: "zone1"}: pointer.Int64(0),
-					{key: "zone", value: "zone2"}: pointer.Int64(0),
-				},
+				TopologyValueToPodCounts: []map[string]*int64{{
+					"zone1": ptr.To[int64](0),
+					"zone2": ptr.To[int64](0),
+				}},
 				TopologyNormalizingWeight: []float64{topologyNormalizingWeight(2)},
 			},
 			enableNodeInclusionPolicy: true,
@@ -392,7 +452,7 @@ func TestPreScoreStateEmptyNodes(t *testing.T) {
 		{
 			name: "NodeAffinityPolicy honored with nodeAffinity",
 			pod: st.MakePod().Name("p").Label("foo", "").
-				NodeAffinityIn("foo", []string{""}).
+				NodeAffinityIn("foo", []string{""}, st.NodeSelectorTypeMatchExpressions).
 				SpreadConstraint(1, "zone", v1.ScheduleAnyway, barSelector, nil, nil, nil, nil).
 				Obj(),
 			nodes: []*v1.Node{
@@ -415,10 +475,10 @@ func TestPreScoreStateEmptyNodes(t *testing.T) {
 					},
 				},
 				IgnoredNodes: sets.New[string](),
-				TopologyPairToPodCounts: map[topologyPair]*int64{
-					{key: "zone", value: "zone1"}: pointer.Int64(0),
-					{key: "zone", value: "zone2"}: pointer.Int64(0),
-				},
+				TopologyValueToPodCounts: []map[string]*int64{{
+					"zone1": ptr.To[int64](0),
+					"zone2": ptr.To[int64](0),
+				}},
 				TopologyNormalizingWeight: []float64{topologyNormalizingWeight(2)},
 			},
 			enableNodeInclusionPolicy: true,
@@ -426,7 +486,7 @@ func TestPreScoreStateEmptyNodes(t *testing.T) {
 		{
 			name: "NodeAffinityPolicy ignored with nodeAffinity",
 			pod: st.MakePod().Name("p").Label("foo", "").
-				NodeAffinityIn("foo", []string{""}).
+				NodeAffinityIn("foo", []string{""}, st.NodeSelectorTypeMatchExpressions).
 				SpreadConstraint(1, "zone", v1.ScheduleAnyway, barSelector, nil, &ignorePolicy, nil, nil).
 				Obj(),
 			nodes: []*v1.Node{
@@ -449,10 +509,10 @@ func TestPreScoreStateEmptyNodes(t *testing.T) {
 					},
 				},
 				IgnoredNodes: sets.New[string](),
-				TopologyPairToPodCounts: map[topologyPair]*int64{
-					{key: "zone", value: "zone1"}: pointer.Int64(0),
-					{key: "zone", value: "zone2"}: pointer.Int64(0),
-				},
+				TopologyValueToPodCounts: []map[string]*int64{{
+					"zone1": ptr.To[int64](0),
+					"zone2": ptr.To[int64](0),
+				}},
 				TopologyNormalizingWeight: []float64{topologyNormalizingWeight(2)},
 			},
 			enableNodeInclusionPolicy: true,
@@ -482,10 +542,10 @@ func TestPreScoreStateEmptyNodes(t *testing.T) {
 					},
 				},
 				IgnoredNodes: sets.New[string](),
-				TopologyPairToPodCounts: map[topologyPair]*int64{
-					{key: "zone", value: "zone1"}: pointer.Int64(0),
-					{key: "zone", value: "zone2"}: pointer.Int64(0),
-				},
+				TopologyValueToPodCounts: []map[string]*int64{{
+					"zone1": ptr.To[int64](0),
+					"zone2": ptr.To[int64](0),
+				}},
 				TopologyNormalizingWeight: []float64{topologyNormalizingWeight(2)},
 			},
 			enableNodeInclusionPolicy: true,
@@ -515,10 +575,10 @@ func TestPreScoreStateEmptyNodes(t *testing.T) {
 					},
 				},
 				IgnoredNodes: sets.New[string](),
-				TopologyPairToPodCounts: map[topologyPair]*int64{
-					{key: "zone", value: "zone1"}: pointer.Int64(0),
-					{key: "zone", value: "zone2"}: pointer.Int64(0),
-				},
+				TopologyValueToPodCounts: []map[string]*int64{{
+					"zone1": ptr.To[int64](0),
+					"zone2": ptr.To[int64](0),
+				}},
 				TopologyNormalizingWeight: []float64{topologyNormalizingWeight(2)},
 			},
 			enableNodeInclusionPolicy: true,
@@ -526,16 +586,17 @@ func TestPreScoreStateEmptyNodes(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ctx, cancel := context.WithCancel(context.Background())
+			_, ctx := ktesting.NewTestContext(t)
+			ctx, cancel := context.WithCancel(ctx)
 			defer cancel()
-			informerFactory := informers.NewSharedInformerFactory(fake.NewSimpleClientset(tt.objs...), 0)
-			f, err := frameworkruntime.NewFramework(nil, nil, ctx.Done(),
+			informerFactory := informers.NewSharedInformerFactory(fake.NewClientset(tt.objs...), 0)
+			f, err := frameworkruntime.NewFramework(ctx, nil, nil,
 				frameworkruntime.WithSnapshotSharedLister(cache.NewSnapshot(nil, tt.nodes)),
 				frameworkruntime.WithInformerFactory(informerFactory))
 			if err != nil {
 				t.Fatalf("Failed creating framework runtime: %v", err)
 			}
-			pl, err := New(&tt.config, f, feature.Features{EnableNodeInclusionPolicyInPodTopologySpread: tt.enableNodeInclusionPolicy})
+			pl, err := New(ctx, &tt.config, f, feature.Features{EnableNodeInclusionPolicyInPodTopologySpread: tt.enableNodeInclusionPolicy})
 			if err != nil {
 				t.Fatalf("Failed creating plugin: %v", err)
 			}
@@ -543,7 +604,7 @@ func TestPreScoreStateEmptyNodes(t *testing.T) {
 			informerFactory.WaitForCacheSync(ctx.Done())
 			p := pl.(*PodTopologySpread)
 			cs := framework.NewCycleState()
-			if s := p.PreScore(context.Background(), cs, tt.pod, tt.nodes); !s.IsSuccess() {
+			if s := p.PreScore(ctx, cs, tt.pod, tf.BuildNodeInfos(tt.nodes)); !s.IsSuccess() {
 				t.Fatal(s.AsError())
 			}
 
@@ -551,7 +612,7 @@ func TestPreScoreStateEmptyNodes(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if diff := cmp.Diff(tt.want, got, cmpOpts...); diff != "" {
+			if diff := cmp.Diff(tt.want, got, stateCmpOpts...); diff != "" {
 				t.Errorf("PodTopologySpread#PreScore() returned (-want, +got):\n%s", diff)
 			}
 		})
@@ -905,6 +966,33 @@ func TestPodTopologySpreadScore(t *testing.T) {
 			},
 		},
 		{
+			name: "two Constraints on zone, 2 out of 4 nodes are candidates",
+			pod: st.MakePod().Name("p").Label("foo", "").Label("bar", "").
+				SpreadConstraint(1, "zone", v1.ScheduleAnyway, fooSelector, nil, nil, nil, nil).
+				SpreadConstraint(1, "zone", v1.ScheduleAnyway, barSelector, nil, nil, nil, nil).
+				Obj(),
+			existingPods: []*v1.Pod{
+				st.MakePod().Name("p-a1").Node("node-a").Label("foo", "").Label("bar", "").Obj(),
+				st.MakePod().Name("p-a2").Node("node-a").Label("foo", "").Obj(),
+				st.MakePod().Name("p-b1").Node("node-b").Label("foo", "").Label("bar", "").Obj(),
+				st.MakePod().Name("p-y1").Node("node-y").Label("foo", "").Obj(),
+				st.MakePod().Name("p-y2").Node("node-y").Label("foo", "").Label("bar", "").Obj(),
+				st.MakePod().Name("p-y3").Node("node-y").Label("foo", "").Obj(),
+			},
+			nodes: []*v1.Node{
+				st.MakeNode().Name("node-a").Label("zone", "zone1").Obj(),
+				st.MakeNode().Name("node-x").Label("zone", "zone2").Obj(),
+			},
+			failedNodes: []*v1.Node{
+				st.MakeNode().Name("node-b").Label("zone", "zone1").Obj(),
+				st.MakeNode().Name("node-y").Label("zone", "zone2").Obj(),
+			},
+			want: []framework.NodeScore{
+				{Name: "node-a", Score: 85},
+				{Name: "node-x", Score: 100},
+			},
+		},
+		{
 			// If Constraints hold different labelSelectors, it's a little complex.
 			// +----------------------+------------------------+
 			// |         zone1        |          zone2         |
@@ -1042,7 +1130,7 @@ func TestPodTopologySpreadScore(t *testing.T) {
 				"node",
 				v1.ScheduleAnyway,
 				fooSelector,
-				pointer.Int32(10), // larger than the number of domains(3)
+				ptr.To[int32](10), // larger than the number of domains(3)
 				nil,
 				nil,
 				nil,
@@ -1116,7 +1204,7 @@ func TestPodTopologySpreadScore(t *testing.T) {
 		{
 			name: "NodeAffinityPolicy honoed with nodeAffinity",
 			pod: st.MakePod().Name("p").Label("foo", "").
-				NodeAffinityIn("foo", []string{""}).
+				NodeAffinityIn("foo", []string{""}, st.NodeSelectorTypeMatchExpressions).
 				SpreadConstraint(1, "node", v1.ScheduleAnyway, fooSelector, nil, nil, nil, nil).
 				Obj(),
 			nodes: []*v1.Node{
@@ -1140,7 +1228,7 @@ func TestPodTopologySpreadScore(t *testing.T) {
 		{
 			name: "NodeAffinityPolicy ignored with nodeAffinity",
 			pod: st.MakePod().Name("p").Label("foo", "").
-				NodeAffinityIn("foo", []string{""}).
+				NodeAffinityIn("foo", []string{""}, st.NodeSelectorTypeMatchExpressions).
 				SpreadConstraint(1, "node", v1.ScheduleAnyway, fooSelector, nil, &ignorePolicy, nil, nil).
 				Obj(),
 			nodes: []*v1.Node{
@@ -1289,7 +1377,8 @@ func TestPodTopologySpreadScore(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ctx, cancel := context.WithCancel(context.Background())
+			_, ctx := ktesting.NewTestContext(t)
+			ctx, cancel := context.WithCancel(ctx)
 			t.Cleanup(cancel)
 			allNodes := append([]*v1.Node{}, tt.nodes...)
 			allNodes = append(allNodes, tt.failedNodes...)
@@ -1299,7 +1388,7 @@ func TestPodTopologySpreadScore(t *testing.T) {
 			p.enableNodeInclusionPolicyInPodTopologySpread = tt.enableNodeInclusionPolicy
 			p.enableMatchLabelKeysInPodTopologySpread = tt.enableMatchLabelKeys
 
-			status := p.PreScore(context.Background(), state, tt.pod, tt.nodes)
+			status := p.PreScore(ctx, state, tt.pod, tf.BuildNodeInfos(tt.nodes))
 			if !status.IsSuccess() {
 				t.Errorf("unexpected error: %v", status)
 			}
@@ -1307,7 +1396,11 @@ func TestPodTopologySpreadScore(t *testing.T) {
 			var gotList framework.NodeScoreList
 			for _, n := range tt.nodes {
 				nodeName := n.Name
-				score, status := p.Score(ctx, state, tt.pod, nodeName)
+				nodeInfo, err := p.sharedLister.NodeInfos().Get(n.Name)
+				if err != nil {
+					t.Errorf("failed to get node %q from snapshot: %v", n.Name, err)
+				}
+				score, status := p.Score(ctx, state, tt.pod, nodeInfo)
 				if !status.IsSuccess() {
 					t.Errorf("unexpected error: %v", status)
 				}
@@ -1318,7 +1411,7 @@ func TestPodTopologySpreadScore(t *testing.T) {
 			if !status.IsSuccess() {
 				t.Errorf("unexpected error: %v", status)
 			}
-			if diff := cmp.Diff(tt.want, gotList, cmpOpts...); diff != "" {
+			if diff := cmp.Diff(tt.want, gotList); diff != "" {
 				t.Errorf("unexpected scores (-want,+got):\n%s", diff)
 			}
 		})
@@ -1364,108 +1457,38 @@ func BenchmarkTestPodTopologySpreadScore(b *testing.B) {
 	}
 	for _, tt := range tests {
 		b.Run(tt.name, func(b *testing.B) {
+			_, ctx := ktesting.NewTestContext(b)
 			existingPods, allNodes, filteredNodes := st.MakeNodesAndPodsForEvenPodsSpread(tt.pod.Labels, tt.existingPodsNum, tt.allNodesNum, tt.filteredNodesNum)
 			state := framework.NewCycleState()
-			pl := plugintesting.SetupPlugin(b, podTopologySpreadFunc, &config.PodTopologySpreadArgs{DefaultingType: config.ListDefaulting}, cache.NewSnapshot(existingPods, allNodes))
+			pl := plugintesting.SetupPlugin(ctx, b, podTopologySpreadFunc, &config.PodTopologySpreadArgs{DefaultingType: config.ListDefaulting}, cache.NewSnapshot(existingPods, allNodes))
 			p := pl.(*PodTopologySpread)
 
-			status := p.PreScore(context.Background(), state, tt.pod, filteredNodes)
+			status := p.PreScore(ctx, state, tt.pod, tf.BuildNodeInfos(filteredNodes))
 			if !status.IsSuccess() {
 				b.Fatalf("unexpected error: %v", status)
+			}
+			nodeInfos := make([]*framework.NodeInfo, len(filteredNodes))
+			for i, n := range filteredNodes {
+				nodeInfo, err := p.sharedLister.NodeInfos().Get(n.Name)
+				if err != nil {
+					b.Fatalf("failed to get node %q from snapshot: %v", n.Name, err)
+				}
+				nodeInfos[i] = nodeInfo
 			}
 			b.ResetTimer()
 
 			for i := 0; i < b.N; i++ {
 				var gotList framework.NodeScoreList
-				for _, n := range filteredNodes {
-					nodeName := n.Name
-					score, status := p.Score(context.Background(), state, tt.pod, nodeName)
+				for _, nodeInfo := range nodeInfos {
+					nodeName := nodeInfo.Node().Name
+					score, status := p.Score(ctx, state, tt.pod, nodeInfo)
 					if !status.IsSuccess() {
 						b.Fatalf("unexpected error: %v", status)
 					}
 					gotList = append(gotList, framework.NodeScore{Name: nodeName, Score: score})
 				}
 
-				status = p.NormalizeScore(context.Background(), state, tt.pod, gotList)
-				if !status.IsSuccess() {
-					b.Fatal(status)
-				}
-			}
-		})
-	}
-}
-
-// The following test allows to compare PodTopologySpread.Score with
-// SelectorSpread.Score by using a similar rule.
-// See pkg/scheduler/framework/plugins/selectorspread/selector_spread_perf_test.go
-// for the equivalent test.
-
-var (
-	tests = []struct {
-		name            string
-		existingPodsNum int
-		allNodesNum     int
-	}{
-		{
-			name:            "100nodes",
-			existingPodsNum: 1000,
-			allNodesNum:     100,
-		},
-		{
-			name:            "1000nodes",
-			existingPodsNum: 10000,
-			allNodesNum:     1000,
-		},
-		{
-			name:            "5000nodes",
-			existingPodsNum: 50000,
-			allNodesNum:     5000,
-		},
-	}
-)
-
-func BenchmarkTestDefaultEvenPodsSpreadPriority(b *testing.B) {
-	for _, tt := range tests {
-		b.Run(tt.name, func(b *testing.B) {
-			pod := st.MakePod().Name("p").Label("foo", "").Obj()
-			existingPods, allNodes, filteredNodes := st.MakeNodesAndPodsForEvenPodsSpread(pod.Labels, tt.existingPodsNum, tt.allNodesNum, tt.allNodesNum)
-			state := framework.NewCycleState()
-			snapshot := cache.NewSnapshot(existingPods, allNodes)
-			client := fake.NewSimpleClientset(
-				&v1.Service{Spec: v1.ServiceSpec{Selector: map[string]string{"foo": ""}}},
-			)
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-			informerFactory := informers.NewSharedInformerFactory(client, 0)
-			f, err := frameworkruntime.NewFramework(nil, nil, ctx.Done(),
-				frameworkruntime.WithSnapshotSharedLister(snapshot),
-				frameworkruntime.WithInformerFactory(informerFactory))
-			if err != nil {
-				b.Fatalf("Failed creating framework runtime: %v", err)
-			}
-			pl, err := New(&config.PodTopologySpreadArgs{DefaultingType: config.SystemDefaulting}, f, feature.Features{})
-			if err != nil {
-				b.Fatalf("Failed creating plugin: %v", err)
-			}
-			p := pl.(*PodTopologySpread)
-
-			informerFactory.Start(ctx.Done())
-			informerFactory.WaitForCacheSync(ctx.Done())
-			b.ResetTimer()
-
-			for i := 0; i < b.N; i++ {
-				status := p.PreScore(ctx, state, pod, filteredNodes)
-				if !status.IsSuccess() {
-					b.Fatalf("unexpected error: %v", status)
-				}
-				gotList := make(framework.NodeScoreList, len(filteredNodes))
-				scoreNode := func(i int) {
-					n := filteredNodes[i]
-					score, _ := p.Score(ctx, state, pod, n.Name)
-					gotList[i] = framework.NodeScore{Name: n.Name, Score: score}
-				}
-				p.parallelizer.Until(ctx, len(filteredNodes), scoreNode, "")
-				status = p.NormalizeScore(ctx, state, pod, gotList)
+				status = p.NormalizeScore(ctx, state, tt.pod, gotList)
 				if !status.IsSuccess() {
 					b.Fatal(status)
 				}

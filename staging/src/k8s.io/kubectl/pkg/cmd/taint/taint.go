@@ -89,7 +89,7 @@ var (
 		# Remove from node 'foo' all the taints with key 'dedicated'
 		kubectl taint nodes foo dedicated-
 
-		# Add a taint with key 'dedicated' on nodes having label mylabel=X
+		# Add a taint with key 'dedicated' on nodes having label myLabel=X
 		kubectl taint node -l myLabel=X  dedicated=foo:PreferNoSchedule
 
 		# Add to node 'foo' a taint with key 'bar' and no value
@@ -183,7 +183,7 @@ func (o *TaintOptions) Complete(f cmdutil.Factory, cmd *cobra.Command, args []st
 	}
 
 	if o.taintsToAdd, o.taintsToRemove, err = parseTaints(taintArgs); err != nil {
-		return cmdutil.UsageErrorf(cmd, err.Error())
+		return cmdutil.UsageErrorf(cmd, "%s", err.Error())
 	}
 	o.builder = f.NewBuilder().
 		WithScheme(scheme.Scheme, scheme.Scheme.PrioritizedVersionsAllGroups()...).

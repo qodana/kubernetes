@@ -28,34 +28,39 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/util/uuid"
+	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/kubernetes/pkg/kubelet/events"
+	"k8s.io/kubernetes/test/e2e/feature"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	e2eoutput "k8s.io/kubernetes/test/e2e/framework/pod/output"
 	testutils "k8s.io/kubernetes/test/utils"
+	"k8s.io/kubernetes/test/utils/format"
 	imageutils "k8s.io/kubernetes/test/utils/image"
 	admissionapi "k8s.io/pod-security-admission/api"
+	"k8s.io/utils/ptr"
 )
 
 const runAsUserNameContainerName = "run-as-username-container"
 
-var _ = SIGDescribe("[Feature:Windows] SecurityContext", func() {
+var _ = sigDescribe(feature.Windows, "SecurityContext", skipUnlessWindows(func() {
 	f := framework.NewDefaultFramework("windows-run-as-username")
-	f.NamespacePodSecurityEnforceLevel = admissionapi.LevelPrivileged
+	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
 
 	ginkgo.It("should be able create pods and run containers with a given username", func(ctx context.Context) {
 		ginkgo.By("Creating 2 pods: 1 with the default user, and one with a custom one.")
 		podDefault := runAsUserNamePod(nil)
 		e2eoutput.TestContainerOutput(ctx, f, "check default user", podDefault, 0, []string{"ContainerUser"})
 
-		podUserName := runAsUserNamePod(toPtr("ContainerAdministrator"))
+		podUserName := runAsUserNamePod(ptr.To("ContainerAdministrator"))
 		e2eoutput.TestContainerOutput(ctx, f, "check set user", podUserName, 0, []string{"ContainerAdministrator"})
 	})
 
 	ginkgo.It("should not be able to create pods with unknown usernames at Pod level", func(ctx context.Context) {
 		ginkgo.By("Creating a pod with an invalid username")
-		podInvalid := e2epod.NewPodClient(f).Create(ctx, runAsUserNamePod(toPtr("FooLish")))
+		podInvalid := e2epod.NewPodClient(f).Create(ctx, runAsUserNamePod(ptr.To("FooLish")))
 
 		failedSandboxEventSelector := fields.Set{
 			"involvedObject.kind":      "Pod",
@@ -97,13 +102,13 @@ var _ = SIGDescribe("[Feature:Windows] SecurityContext", func() {
 			}
 
 			return false
-		}, framework.PodStartTimeout, 1*time.Second).Should(gomega.BeTrue())
+		}, framework.PodStartTimeout, 1*time.Second).Should(gomega.BeTrueBecause("expected pod to be terminated"))
 	})
 
 	ginkgo.It("should not be able to create pods with unknown usernames at Container level", func(ctx context.Context) {
 		ginkgo.By("Creating a pod with an invalid username at container level and pod running as ContainerUser")
-		p := runAsUserNamePod(toPtr("FooLish"))
-		p.Spec.SecurityContext.WindowsOptions.RunAsUserName = toPtr("ContainerUser")
+		p := runAsUserNamePod(ptr.To("FooLish"))
+		p.Spec.SecurityContext.WindowsOptions.RunAsUserName = ptr.To("ContainerUser")
 		podInvalid := e2epod.NewPodClient(f).Create(ctx, p)
 
 		framework.Logf("Waiting for pod %s to enter the error state.", podInvalid.Name)
@@ -119,8 +124,8 @@ var _ = SIGDescribe("[Feature:Windows] SecurityContext", func() {
 	ginkgo.It("should override SecurityContext username if set", func(ctx context.Context) {
 		ginkgo.By("Creating a pod with 2 containers with different username configurations.")
 
-		pod := runAsUserNamePod(toPtr("ContainerAdministrator"))
-		pod.Spec.Containers[0].SecurityContext.WindowsOptions.RunAsUserName = toPtr("ContainerUser")
+		pod := runAsUserNamePod(ptr.To("ContainerAdministrator"))
+		pod.Spec.Containers[0].SecurityContext.WindowsOptions.RunAsUserName = ptr.To("ContainerUser")
 		pod.Spec.Containers = append(pod.Spec.Containers, v1.Container{
 			Name:    "run-as-username-new-container",
 			Image:   imageutils.GetE2EImage(imageutils.NonRoot),
@@ -138,7 +143,7 @@ var _ = SIGDescribe("[Feature:Windows] SecurityContext", func() {
 		// pod object to not have those security contexts. However the pod coming to running state is a sufficient
 		// enough condition for us to validate since prior to https://github.com/kubernetes/kubernetes/pull/93475
 		// the pod would have failed to come up.
-		windowsPodWithSELinux := createTestPod(f, windowsBusyBoximage, windowsOS)
+		windowsPodWithSELinux := createTestPod(f, imageutils.GetE2EImage(imageutils.Agnhost), windowsOS)
 		windowsPodWithSELinux.Spec.Containers[0].Args = []string{"test-webserver-with-selinux"}
 		windowsPodWithSELinux.Spec.SecurityContext = &v1.PodSecurityContext{}
 		containerUserName := "ContainerAdministrator"
@@ -158,7 +163,7 @@ var _ = SIGDescribe("[Feature:Windows] SecurityContext", func() {
 	ginkgo.It("should not be able to create pods with containers running as ContainerAdministrator when runAsNonRoot is true", func(ctx context.Context) {
 		ginkgo.By("Creating a pod")
 
-		p := runAsUserNamePod(toPtr("ContainerAdministrator"))
+		p := runAsUserNamePod(ptr.To("ContainerAdministrator"))
 		p.Spec.SecurityContext.RunAsNonRoot = &trueVar
 
 		podInvalid, err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx, p, metav1.CreateOptions{})
@@ -167,16 +172,16 @@ var _ = SIGDescribe("[Feature:Windows] SecurityContext", func() {
 		ginkgo.By("Waiting for pod to finish")
 		event, err := e2epod.NewPodClient(f).WaitForErrorEventOrSuccess(ctx, podInvalid)
 		framework.ExpectNoError(err)
-		framework.ExpectNotEqual(event, nil, "event should not be empty")
+		gomega.Expect(event).ToNot(gomega.BeNil(), "event should not be empty")
 		framework.Logf("Got event: %v", event)
 		expectedEventError := "container's runAsUserName (ContainerAdministrator) which will be regarded as root identity and will break non-root policy"
-		framework.ExpectEqual(true, strings.Contains(event.Message, expectedEventError), "Event error should indicate non-root policy caused container to not start")
+		gomega.Expect(event.Message).Should(gomega.ContainSubstring(expectedEventError), "Event error should indicate non-root policy caused container to not start")
 	})
 
 	ginkgo.It("should not be able to create pods with containers running as CONTAINERADMINISTRATOR when runAsNonRoot is true", func(ctx context.Context) {
 		ginkgo.By("Creating a pod")
 
-		p := runAsUserNamePod(toPtr("CONTAINERADMINISTRATOR"))
+		p := runAsUserNamePod(ptr.To("CONTAINERADMINISTRATOR"))
 		p.Spec.SecurityContext.RunAsNonRoot = &trueVar
 
 		podInvalid, err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx, p, metav1.CreateOptions{})
@@ -185,12 +190,73 @@ var _ = SIGDescribe("[Feature:Windows] SecurityContext", func() {
 		ginkgo.By("Waiting for pod to finish")
 		event, err := e2epod.NewPodClient(f).WaitForErrorEventOrSuccess(ctx, podInvalid)
 		framework.ExpectNoError(err)
-		framework.ExpectNotEqual(event, nil, "event should not be empty")
+		gomega.Expect(event).ToNot(gomega.BeNil(), "event should not be empty")
 		framework.Logf("Got event: %v", event)
 		expectedEventError := "container's runAsUserName (CONTAINERADMINISTRATOR) which will be regarded as root identity and will break non-root policy"
-		framework.ExpectEqual(true, strings.Contains(event.Message, expectedEventError), "Event error should indicate non-root policy caused container to not start")
+		gomega.Expect(event.Message).Should(gomega.ContainSubstring(expectedEventError), "Event error should indicate non-root policy caused container to not start")
 	})
-})
+}))
+
+var _ = sigDescribe(feature.Windows, "SecurityContext", skipUnlessWindows(func() {
+	f := framework.NewDefaultFramework("windows-with-unsupported-fields")
+	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
+
+	ginkgo.It("should be able to create pod and run containers", func(ctx context.Context) {
+		ginkgo.By("Creating 1 pods: run with unsupported fields")
+
+		pod := &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "run-ignore-unsupported-fields",
+				Namespace: f.Namespace.Name,
+			},
+			Spec: v1.PodSpec{
+				NodeSelector: map[string]string{"kubernetes.io/os": "windows"},
+				Containers: []v1.Container{
+					{
+						Name:  "test-container",
+						Image: imageutils.GetE2EImage(imageutils.Pause),
+					},
+				},
+				SecurityContext: &v1.PodSecurityContext{
+					RunAsUser:    ptr.To[int64](999), // windows does not support
+					RunAsGroup:   ptr.To[int64](999), // windows does not support
+					RunAsNonRoot: ptr.To(true),
+				},
+				RestartPolicy: v1.RestartPolicyNever,
+			},
+		}
+
+		pod, err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx, pod, metav1.CreateOptions{})
+		framework.ExpectNoError(err, "Error creating pod")
+
+		podErr := e2epod.WaitForPodRunningInNamespace(ctx, f.ClientSet, pod)
+
+		// Get the logs and events before calling ExpectNoError, so we can debug any errors.
+		var logs string
+		var events *v1.EventList
+		if err := wait.PollUntilContextTimeout(ctx, 30*time.Second, 2*time.Minute, true, func(ctx context.Context) (done bool, err error) {
+			framework.Logf("polling logs")
+			logs, err = e2epod.GetPodLogs(ctx, f.ClientSet, f.Namespace.Name, pod.Name, pod.Spec.Containers[0].Name)
+			if err != nil {
+				framework.Logf("Error pulling logs: %v", err)
+				return false, nil
+			}
+
+			events, err = f.ClientSet.CoreV1().Events(pod.Namespace).Search(scheme.Scheme, pod)
+			if err != nil {
+				return false, fmt.Errorf("error in listing events: %w", err)
+			}
+			return true, nil
+		}); err != nil {
+			framework.Failf("Unexpected error getting pod logs/events: %v", err)
+		} else {
+			framework.Logf("Pod logs: \n%v", logs)
+			framework.Logf("Pod events: \n%v", format.Object(events, 1))
+		}
+
+		framework.ExpectNoError(podErr)
+	})
+}))
 
 func runAsUserNamePod(username *string) *v1.Pod {
 	podName := "run-as-username-" + string(uuid.NewUUID())
@@ -220,10 +286,6 @@ func runAsUserNamePod(username *string) *v1.Pod {
 			RestartPolicy: v1.RestartPolicyNever,
 		},
 	}
-}
-
-func toPtr(s string) *string {
-	return &s
 }
 
 func eventOccurred(ctx context.Context, c clientset.Interface, namespace, eventSelector, msg string) (bool, error) {

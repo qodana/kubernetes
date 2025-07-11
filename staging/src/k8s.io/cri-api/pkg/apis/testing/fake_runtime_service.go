@@ -23,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	"google.golang.org/protobuf/proto"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
 
@@ -64,14 +65,15 @@ type FakeRuntimeService struct {
 	Called []string
 	Errors map[string][]error
 
-	FakeStatus            *runtimeapi.RuntimeStatus
-	Containers            map[string]*FakeContainer
-	Sandboxes             map[string]*FakePodSandbox
-	FakeContainerStats    map[string]*runtimeapi.ContainerStats
-	FakePodSandboxStats   map[string]*runtimeapi.PodSandboxStats
-	FakePodSandboxMetrics map[string]*runtimeapi.PodSandboxMetrics
-	FakeMetricDescriptors map[string]*runtimeapi.MetricDescriptor
-	FakeContainerMetrics  map[string]*runtimeapi.ContainerMetrics
+	FakeStatus             *runtimeapi.RuntimeStatus
+	Containers             map[string]*FakeContainer
+	Sandboxes              map[string]*FakePodSandbox
+	FakeContainerStats     map[string]*runtimeapi.ContainerStats
+	FakePodSandboxStats    map[string]*runtimeapi.PodSandboxStats
+	FakePodSandboxMetrics  map[string]*runtimeapi.PodSandboxMetrics
+	FakeMetricDescriptors  map[string]*runtimeapi.MetricDescriptor
+	FakeContainerMetrics   map[string]*runtimeapi.ContainerMetrics
+	FakeLinuxConfiguration *runtimeapi.LinuxRuntimeConfiguration
 
 	ErrorOnSandboxCreate bool
 }
@@ -301,8 +303,8 @@ func (r *FakeRuntimeService) PodSandboxStatus(_ context.Context, podSandboxID st
 		return nil, fmt.Errorf("pod sandbox %q not found", podSandboxID)
 	}
 
-	status := s.PodSandboxStatus
-	return &runtimeapi.PodSandboxStatusResponse{Status: &status}, nil
+	status := proto.Clone(&s.PodSandboxStatus).(*runtimeapi.PodSandboxStatus)
+	return &runtimeapi.PodSandboxStatusResponse{Status: status}, nil
 }
 
 // ListPodSandbox returns the list of pod sandboxes in the FakeRuntimeService.
@@ -510,8 +512,8 @@ func (r *FakeRuntimeService) ContainerStatus(_ context.Context, containerID stri
 		return nil, fmt.Errorf("container %q not found", containerID)
 	}
 
-	status := c.ContainerStatus
-	return &runtimeapi.ContainerStatusResponse{Status: &status}, nil
+	status := proto.Clone(&c.ContainerStatus).(*runtimeapi.ContainerStatus)
+	return &runtimeapi.ContainerStatusResponse{Status: status}, nil
 }
 
 // UpdateContainerResources returns the container resource in the FakeRuntimeService.
@@ -715,7 +717,7 @@ func (r *FakeRuntimeService) CheckpointContainer(_ context.Context, options *run
 	return nil
 }
 
-func (f *FakeRuntimeService) GetContainerEvents(containerEventsCh chan *runtimeapi.ContainerEventResponse) error {
+func (f *FakeRuntimeService) GetContainerEvents(ctx context.Context, containerEventsCh chan *runtimeapi.ContainerEventResponse, connectionEstablishedCallback func(runtimeapi.RuntimeService_GetContainerEventsClient)) error {
 	return nil
 }
 
@@ -779,4 +781,30 @@ func (r *FakeRuntimeService) ListPodSandboxMetrics(_ context.Context) ([]*runtim
 	}
 
 	return result, nil
+}
+
+// RuntimeConfig returns runtime configuration of the FakeRuntimeService.
+func (r *FakeRuntimeService) RuntimeConfig(_ context.Context) (*runtimeapi.RuntimeConfigResponse, error) {
+	r.Lock()
+	defer r.Unlock()
+
+	r.Called = append(r.Called, "RuntimeConfig")
+	if err := r.popError("RuntimeConfig"); err != nil {
+		return nil, err
+	}
+
+	return &runtimeapi.RuntimeConfigResponse{Linux: r.FakeLinuxConfiguration}, nil
+}
+
+// UpdatePodSandboxResources returns the container resource in the FakeRuntimeService.
+func (r *FakeRuntimeService) UpdatePodSandboxResources(context.Context, *runtimeapi.UpdatePodSandboxResourcesRequest) (*runtimeapi.UpdatePodSandboxResourcesResponse, error) {
+	r.Lock()
+	defer r.Unlock()
+
+	r.Called = append(r.Called, "UpdatePodSandboxResources")
+	if err := r.popError("UpdatePodSandboxResources"); err != nil {
+		return nil, err
+	}
+
+	return &runtimeapi.UpdatePodSandboxResourcesResponse{}, nil
 }

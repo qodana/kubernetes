@@ -70,7 +70,7 @@ var (
 		# Edit the deployment 'mydeployment' in YAML and save the modified config in its annotation
 		kubectl edit deployment/mydeployment -o yaml --save-config
 
-		# Edit the deployment/mydeployment's status subresource
+		# Edit the 'status' subresource for the 'mydeployment' deployment
 		kubectl edit deployment mydeployment --subresource='status'`))
 )
 
@@ -103,6 +103,6 @@ func NewCmdEdit(f cmdutil.Factory, ioStreams genericiooptions.IOStreams) *cobra.
 		"Defaults to the line ending native to your platform.")
 	cmdutil.AddFieldManagerFlagVar(cmd, &o.FieldManager, "kubectl-edit")
 	cmdutil.AddApplyAnnotationVarFlags(cmd, &o.ApplyAnnotation)
-	cmdutil.AddSubresourceFlags(cmd, &o.Subresource, "If specified, edit will operate on the subresource of the requested object.", editor.SupportedSubresources...)
+	cmdutil.AddSubresourceFlags(cmd, &o.Subresource, "If specified, edit will operate on the subresource of the requested object.")
 	return cmd
 }

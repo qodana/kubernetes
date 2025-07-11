@@ -59,9 +59,9 @@ func NewTestREST(resp testResponse) *REST {
 		err:    resp.err,
 	}
 	return &REST{
-		GetServersToValidate: func() map[string]*Server {
-			return map[string]*Server{
-				"test1": {Addr: "testserver1", Port: 8000, Path: "/healthz", Prober: prober},
+		GetServersToValidate: func() map[string]Server {
+			return map[string]Server{
+				"test1": &HttpServer{Addr: "testserver1", Port: 8000, Path: "/healthz", Prober: prober},
 			}
 		},
 	}
@@ -177,7 +177,7 @@ func TestGet_BadName(t *testing.T) {
 	if err == nil {
 		t.Fatalf("Expected error, but did not get one")
 	}
-	if !strings.Contains(err.Error(), "Component not found: invalidname") {
+	if !strings.Contains(err.Error(), `componentstatus "invalidname" not found`) {
 		t.Fatalf("Got unexpected error: %v", err)
 	}
 }

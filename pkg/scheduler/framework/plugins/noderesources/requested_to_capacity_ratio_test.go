@@ -23,16 +23,18 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/assert"
+
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/validation/field"
-	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/klog/v2/ktesting"
 	"k8s.io/kubernetes/pkg/scheduler/apis/config"
+	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	plfeature "k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/helper"
 	"k8s.io/kubernetes/pkg/scheduler/framework/runtime"
-	"k8s.io/kubernetes/pkg/scheduler/internal/cache"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
+	tf "k8s.io/kubernetes/pkg/scheduler/testing/framework"
 )
 
 func TestRequestedToCapacityRatioScoringStrategy(t *testing.T) {
@@ -103,14 +105,15 @@ func TestRequestedToCapacityRatioScoringStrategy(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			ctx, cancel := context.WithCancel(context.Background())
+			_, ctx := ktesting.NewTestContext(t)
+			ctx, cancel := context.WithCancel(ctx)
 			defer cancel()
 
 			state := framework.NewCycleState()
 			snapshot := cache.NewSnapshot(test.existingPods, test.nodes)
-			fh, _ := runtime.NewFramework(nil, nil, ctx.Done(), runtime.WithSnapshotSharedLister(snapshot))
+			fh, _ := runtime.NewFramework(ctx, nil, nil, runtime.WithSnapshotSharedLister(snapshot))
 
-			p, err := NewFit(&config.NodeResourcesFitArgs{
+			p, err := NewFit(ctx, &config.NodeResourcesFitArgs{
 				ScoringStrategy: &config.ScoringStrategy{
 					Type:      config.RequestedToCapacityRatio,
 					Resources: test.resources,
@@ -129,11 +132,15 @@ func TestRequestedToCapacityRatioScoringStrategy(t *testing.T) {
 
 			var gotScores framework.NodeScoreList
 			for _, n := range test.nodes {
-				status := p.(framework.PreScorePlugin).PreScore(ctx, state, test.requestedPod, test.nodes)
+				status := p.(framework.PreScorePlugin).PreScore(ctx, state, test.requestedPod, tf.BuildNodeInfos(test.nodes))
 				if !status.IsSuccess() {
 					t.Errorf("PreScore is expected to return success, but didn't. Got status: %v", status)
 				}
-				score, status := p.(framework.ScorePlugin).Score(ctx, state, test.requestedPod, n.Name)
+				nodeInfo, err := snapshot.Get(n.Name)
+				if err != nil {
+					t.Errorf("failed to get node %q from snapshot: %v", n.Name, err)
+				}
+				score, status := p.(framework.ScorePlugin).Score(ctx, state, test.requestedPod, nodeInfo)
 				if !status.IsSuccess() {
 					t.Errorf("Score is expected to return success, but didn't. Got status: %v", status)
 				}
@@ -303,7 +310,8 @@ func TestResourceBinPackingSingleExtended(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			state := framework.NewCycleState()
 			snapshot := cache.NewSnapshot(test.pods, test.nodes)
-			fh, _ := runtime.NewFramework(nil, nil, wait.NeverStop, runtime.WithSnapshotSharedLister(snapshot))
+			_, ctx := ktesting.NewTestContext(t)
+			fh, _ := runtime.NewFramework(ctx, nil, nil, runtime.WithSnapshotSharedLister(snapshot))
 			args := config.NodeResourcesFitArgs{
 				ScoringStrategy: &config.ScoringStrategy{
 					Type: config.RequestedToCapacityRatio,
@@ -318,18 +326,22 @@ func TestResourceBinPackingSingleExtended(t *testing.T) {
 					},
 				},
 			}
-			p, err := NewFit(&args, fh, plfeature.Features{})
+			p, err := NewFit(ctx, &args, fh, plfeature.Features{})
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
 
 			var gotList framework.NodeScoreList
 			for _, n := range test.nodes {
-				status := p.(framework.PreScorePlugin).PreScore(context.Background(), state, test.pod, test.nodes)
+				status := p.(framework.PreScorePlugin).PreScore(ctx, state, test.pod, tf.BuildNodeInfos(test.nodes))
 				if !status.IsSuccess() {
 					t.Errorf("PreScore is expected to return success, but didn't. Got status: %v", status)
 				}
-				score, status := p.(framework.ScorePlugin).Score(context.Background(), state, test.pod, n.Name)
+				nodeInfo, err := snapshot.Get(n.Name)
+				if err != nil {
+					t.Errorf("failed to get node %q from snapshot: %v", n.Name, err)
+				}
+				score, status := p.(framework.ScorePlugin).Score(ctx, state, test.pod, nodeInfo)
 				if !status.IsSuccess() {
 					t.Errorf("Score is expected to return success, but didn't. Got status: %v", status)
 				}
@@ -527,7 +539,8 @@ func TestResourceBinPackingMultipleExtended(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			state := framework.NewCycleState()
 			snapshot := cache.NewSnapshot(test.pods, test.nodes)
-			fh, _ := runtime.NewFramework(nil, nil, wait.NeverStop, runtime.WithSnapshotSharedLister(snapshot))
+			_, ctx := ktesting.NewTestContext(t)
+			fh, _ := runtime.NewFramework(ctx, nil, nil, runtime.WithSnapshotSharedLister(snapshot))
 
 			args := config.NodeResourcesFitArgs{
 				ScoringStrategy: &config.ScoringStrategy{
@@ -545,19 +558,23 @@ func TestResourceBinPackingMultipleExtended(t *testing.T) {
 				},
 			}
 
-			p, err := NewFit(&args, fh, plfeature.Features{})
+			p, err := NewFit(ctx, &args, fh, plfeature.Features{})
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
 
-			status := p.(framework.PreScorePlugin).PreScore(context.Background(), state, test.pod, test.nodes)
+			status := p.(framework.PreScorePlugin).PreScore(ctx, state, test.pod, tf.BuildNodeInfos(test.nodes))
 			if !status.IsSuccess() {
 				t.Errorf("PreScore is expected to return success, but didn't. Got status: %v", status)
 			}
 
 			var gotScores framework.NodeScoreList
 			for _, n := range test.nodes {
-				score, status := p.(framework.ScorePlugin).Score(context.Background(), state, test.pod, n.Name)
+				nodeInfo, err := snapshot.Get(n.Name)
+				if err != nil {
+					t.Errorf("failed to get node %q from snapshot: %v", n.Name, err)
+				}
+				score, status := p.(framework.ScorePlugin).Score(ctx, state, test.pod, nodeInfo)
 				if !status.IsSuccess() {
 					t.Errorf("Score is expected to return success, but didn't. Got status: %v", status)
 				}

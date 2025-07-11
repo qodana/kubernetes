@@ -28,19 +28,17 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/lithammer/dedent"
-	"github.com/pkg/errors"
 
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/version"
+	utiltesting "k8s.io/client-go/util/testing"
 	"k8s.io/utils/exec"
 	fakeexec "k8s.io/utils/exec/testing"
 
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
-	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta3"
-	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
+	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta4"
 	configutil "k8s.io/kubernetes/cmd/kubeadm/app/util/config"
-	utilruntime "k8s.io/kubernetes/cmd/kubeadm/app/util/runtime"
+	"k8s.io/kubernetes/cmd/kubeadm/app/util/errors"
 )
 
 var (
@@ -195,7 +193,7 @@ func TestFileExistingCheck(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create file: %v", err)
 	}
-	defer os.Remove(f.Name())
+	defer utiltesting.CloseAndRemove(t, f)
 	var tests = []struct {
 		name          string
 		check         FileExistingCheck
@@ -234,7 +232,7 @@ func TestFileAvailableCheck(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create file: %v", err)
 	}
-	defer os.Remove(f.Name())
+	defer utiltesting.CloseAndRemove(t, f)
 	var tests = []struct {
 		name          string
 		check         FileAvailableCheck
@@ -425,16 +423,16 @@ func TestRunChecks(t *testing.T) {
 	}{
 		{[]Checker{}, true, ""},
 		{[]Checker{preflightCheckTest{"warning"}}, true, "\t[WARNING preflightCheckTest]: warning\n"}, // should just print warning
-		{[]Checker{preflightCheckTest{"error"}}, false, ""},
-		{[]Checker{preflightCheckTest{"test"}}, false, ""},
+		{[]Checker{preflightCheckTest{"error"}}, false, "[preflight] Some fatal errors occurred:\n\t[ERROR preflightCheckTest]: fake error\n[preflight] If you know what you are doing, you can make a check non-fatal with `--ignore-preflight-errors=...`\n"},
+		{[]Checker{preflightCheckTest{"test"}}, false, "[preflight] Some fatal errors occurred:\n\t[ERROR preflightCheckTest]: fake error\n[preflight] If you know what you are doing, you can make a check non-fatal with `--ignore-preflight-errors=...`\n"},
 		{[]Checker{DirAvailableCheck{Path: "/does/not/exist"}}, true, ""},
-		{[]Checker{DirAvailableCheck{Path: "/"}}, false, ""},
+		{[]Checker{DirAvailableCheck{Path: "/"}}, false, "[preflight] Some fatal errors occurred:\n\t[ERROR DirAvailable--]: / is not empty\n[preflight] If you know what you are doing, you can make a check non-fatal with `--ignore-preflight-errors=...`\n"},
 		{[]Checker{FileAvailableCheck{Path: "/does/not/exist"}}, true, ""},
-		{[]Checker{FileContentCheck{Path: "/does/not/exist"}}, false, ""},
+		{[]Checker{FileContentCheck{Path: "/does/not/exist"}}, false, "[preflight] Some fatal errors occurred:\n\t[ERROR FileContent--does-not-exist]: /does/not/exist does not exist\n[preflight] If you know what you are doing, you can make a check non-fatal with `--ignore-preflight-errors=...`\n"},
 		{[]Checker{FileContentCheck{Path: "/"}}, true, ""},
-		{[]Checker{FileContentCheck{Path: "/", Content: []byte("does not exist")}}, false, ""},
+		{[]Checker{FileContentCheck{Path: "/", Content: []byte("content can not be read")}}, false, "[preflight] Some fatal errors occurred:\n\t[ERROR FileContent--]: / could not be read\n[preflight] If you know what you are doing, you can make a check non-fatal with `--ignore-preflight-errors=...`\n"},
 		{[]Checker{InPathCheck{executable: "foobarbaz", exec: exec.New()}}, true, "\t[WARNING FileExisting-foobarbaz]: foobarbaz not found in system path\n"},
-		{[]Checker{InPathCheck{executable: "foobarbaz", mandatory: true, exec: exec.New()}}, false, ""},
+		{[]Checker{InPathCheck{executable: "foobarbaz", mandatory: true, exec: exec.New()}}, false, "[preflight] Some fatal errors occurred:\n\t[ERROR FileExisting-foobarbaz]: foobarbaz not found in system path\n[preflight] If you know what you are doing, you can make a check non-fatal with `--ignore-preflight-errors=...`\n"},
 		{[]Checker{InPathCheck{executable: "foobar", mandatory: false, exec: exec.New(), suggestion: "install foobar"}}, true, "\t[WARNING FileExisting-foobar]: foobar not found in system path\nSuggestion: install foobar\n"},
 	}
 	for _, rt := range tokenTest {
@@ -461,8 +459,8 @@ func TestConfigRootCAs(t *testing.T) {
 	if err != nil {
 		t.Errorf("failed configRootCAs:\n\texpected: succeed creating temp CA file\n\tactual:%v", err)
 	}
-	defer os.Remove(f.Name())
-	if err := os.WriteFile(f.Name(), []byte(externalEtcdRootCAFileContent), 0644); err != nil {
+	defer utiltesting.CloseAndRemove(t, f)
+	if _, err := f.Write([]byte(externalEtcdRootCAFileContent)); err != nil {
 		t.Errorf("failed configRootCAs:\n\texpected: succeed writing contents to temp CA file %s\n\tactual:%v", f.Name(), err)
 	}
 
@@ -490,8 +488,8 @@ func TestConfigCertAndKey(t *testing.T) {
 			err,
 		)
 	}
-	defer os.Remove(certFile.Name())
-	if err := os.WriteFile(certFile.Name(), []byte(externalEtcdCertFileContent), 0644); err != nil {
+	defer utiltesting.CloseAndRemove(t, certFile)
+	if _, err := certFile.Write([]byte(externalEtcdCertFileContent)); err != nil {
 		t.Errorf(
 			"failed configCertAndKey:\n\texpected: succeed writing contents to temp CertFile file %s\n\tactual:%v",
 			certFile.Name(),
@@ -506,8 +504,8 @@ func TestConfigCertAndKey(t *testing.T) {
 			err,
 		)
 	}
-	defer os.Remove(keyFile.Name())
-	if err := os.WriteFile(keyFile.Name(), []byte(externalEtcdKeyFileContent), 0644); err != nil {
+	defer utiltesting.CloseAndRemove(t, keyFile)
+	if _, err := keyFile.Write([]byte(externalEtcdKeyFileContent)); err != nil {
 		t.Errorf(
 			"failed configCertAndKey:\n\texpected: succeed writing contents to temp KeyFile file %s\n\tactual:%v",
 			keyFile.Name(),
@@ -849,100 +847,6 @@ func TestSetHasItemOrAll(t *testing.T) {
 	}
 }
 
-func TestImagePullCheck(t *testing.T) {
-	fcmd := fakeexec.FakeCmd{
-		RunScript: []fakeexec.FakeAction{
-			// Test case 1: img1 and img2 exist, img3 doesn't exist
-			func() ([]byte, []byte, error) { return nil, nil, nil },
-			func() ([]byte, []byte, error) { return nil, nil, nil },
-			func() ([]byte, []byte, error) { return nil, nil, &fakeexec.FakeExitError{Status: 1} },
-
-			// Test case 2: images don't exist
-			func() ([]byte, []byte, error) { return nil, nil, &fakeexec.FakeExitError{Status: 1} },
-			func() ([]byte, []byte, error) { return nil, nil, &fakeexec.FakeExitError{Status: 1} },
-			func() ([]byte, []byte, error) { return nil, nil, &fakeexec.FakeExitError{Status: 1} },
-		},
-		CombinedOutputScript: []fakeexec.FakeAction{
-			// Test case1: pull only img3
-			func() ([]byte, []byte, error) { return nil, nil, nil },
-			// Test case 2: fail to pull image2 and image3
-			// If the pull fails, it will be retried 5 times (see PullImageRetry in constants/constants.go)
-			func() ([]byte, []byte, error) { return nil, nil, nil },
-			func() ([]byte, []byte, error) { return []byte("error"), nil, &fakeexec.FakeExitError{Status: 1} },
-			func() ([]byte, []byte, error) { return []byte("error"), nil, &fakeexec.FakeExitError{Status: 1} },
-			func() ([]byte, []byte, error) { return []byte("error"), nil, &fakeexec.FakeExitError{Status: 1} },
-			func() ([]byte, []byte, error) { return []byte("error"), nil, &fakeexec.FakeExitError{Status: 1} },
-			func() ([]byte, []byte, error) { return []byte("error"), nil, &fakeexec.FakeExitError{Status: 1} },
-			func() ([]byte, []byte, error) { return []byte("error"), nil, &fakeexec.FakeExitError{Status: 1} },
-			func() ([]byte, []byte, error) { return []byte("error"), nil, &fakeexec.FakeExitError{Status: 1} },
-			func() ([]byte, []byte, error) { return []byte("error"), nil, &fakeexec.FakeExitError{Status: 1} },
-			func() ([]byte, []byte, error) { return []byte("error"), nil, &fakeexec.FakeExitError{Status: 1} },
-			func() ([]byte, []byte, error) { return []byte("error"), nil, &fakeexec.FakeExitError{Status: 1} },
-		},
-	}
-
-	fexec := &fakeexec.FakeExec{
-		CommandScript: []fakeexec.FakeCommandAction{
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-		},
-		LookPathFunc: func(cmd string) (string, error) { return "/usr/bin/crictl", nil },
-	}
-
-	containerRuntime, err := utilruntime.NewContainerRuntime(fexec, constants.DefaultCRISocket)
-	if err != nil {
-		t.Errorf("unexpected NewContainerRuntime error: %v", err)
-	}
-
-	check := ImagePullCheck{
-		runtime:         containerRuntime,
-		imageList:       []string{"img1", "img2", "img3"},
-		imagePullPolicy: corev1.PullIfNotPresent,
-	}
-	warnings, errors := check.Check()
-	if len(warnings) != 0 {
-		t.Fatalf("did not expect any warnings but got %q", warnings)
-	}
-	if len(errors) != 0 {
-		t.Fatalf("expected 1 errors but got %d: %q", len(errors), errors)
-	}
-
-	warnings, errors = check.Check()
-	if len(warnings) != 0 {
-		t.Fatalf("did not expect any warnings but got %q", warnings)
-	}
-	if len(errors) != 2 {
-		t.Fatalf("expected 2 errors but got %d: %q", len(errors), errors)
-	}
-
-	// Test with unknown policy
-	check = ImagePullCheck{
-		runtime:         containerRuntime,
-		imageList:       []string{"img1", "img2", "img3"},
-		imagePullPolicy: "",
-	}
-	_, errors = check.Check()
-	if len(errors) != 1 {
-		t.Fatalf("expected 1 error but got %d: %q", len(errors), errors)
-	}
-}
-
 func TestNumCPUCheck(t *testing.T) {
 	var tests = []struct {
 		numCPU      int
@@ -996,11 +900,6 @@ func TestInitIPCheck(t *testing.T) {
 	// skip this test, if OS in not Linux, since it will ONLY pass on Linux.
 	if runtime.GOOS != "linux" {
 		t.Skip("unsupported OS")
-	}
-	// should be a privileged user for the `init` command, otherwise just skip it.
-	isPrivileged := IsPrivilegedUserCheck{}
-	if _, err := isPrivileged.Check(); err != nil {
-		t.Skip("not a privileged user")
 	}
 	internalcfg, err := configutil.DefaultedStaticInitConfiguration()
 	if err != nil {
@@ -1064,15 +963,12 @@ func TestJoinIPCheck(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("unsupported OS")
 	}
-	// should be a privileged user for the `join` command, otherwise just skip it.
-	isPrivileged := IsPrivilegedUserCheck{}
-	if _, err := isPrivileged.Check(); err != nil {
-		t.Skip("not a privileged user")
+
+	opts := configutil.LoadOrDefaultConfigurationOptions{
+		SkipCRIDetect: true,
 	}
+
 	internalcfg, err := configutil.DefaultedJoinConfiguration(&kubeadmapiv1.JoinConfiguration{
-		NodeRegistration: kubeadmapiv1.NodeRegistrationOptions{
-			CRISocket: constants.UnknownCRISocket,
-		},
 		Discovery: kubeadmapiv1.Discovery{
 			BootstrapToken: &kubeadmapiv1.BootstrapTokenDiscovery{
 				Token:                    configutil.PlaceholderToken.Token.String(),
@@ -1080,7 +976,7 @@ func TestJoinIPCheck(t *testing.T) {
 				UnsafeSkipCAVerification: true,
 			},
 		},
-	})
+	}, opts)
 	if err != nil {
 		t.Fatalf("unexpected failure when defaulting JoinConfiguration: %v", err)
 	}

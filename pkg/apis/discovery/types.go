@@ -133,14 +133,27 @@ type EndpointConditions struct {
 
 // EndpointHints provides hints describing how an endpoint should be consumed.
 type EndpointHints struct {
-	// forZones indicates the zone(s) this endpoint should be consumed by to
-	// enable topology aware routing. May contain a maximum of 8 entries.
+	// forZones indicates the zone(s) this endpoint should be consumed by when
+	// using topology aware routing. May contain a maximum of 8 entries.
 	ForZones []ForZone
+
+	// forNodes indicates the node(s) this endpoint should be consumed by when
+	// using topology aware routing.
+	// This is an Alpha feature and is only used when the PreferSameTrafficDistribution
+	// feature gate is enabled. May contain a maximum of 8 entries.
+	// +featureGate=PreferSameTrafficDistribution
+	ForNodes []ForNode
 }
 
 // ForZone provides information about which zones should consume this endpoint.
 type ForZone struct {
 	// name represents the name of the zone.
+	Name string
+}
+
+// ForNode provides information about which nodes should consume this endpoint.
+type ForNode struct {
+	// name represents the name of the node.
 	Name string
 }
 
@@ -170,7 +183,9 @@ type EndpointPort struct {
 	// RFC-6335 and https://www.iana.org/assignments/service-names).
 	//
 	// * Kubernetes-defined prefixed names:
-	//   * 'kubernetes.io/h2c' - HTTP/2 over cleartext as described in https://www.rfc-editor.org/rfc/rfc7540
+	//   * 'kubernetes.io/h2c' - HTTP/2 prior knowledge over cleartext as described in https://www.rfc-editor.org/rfc/rfc9113.html#name-starting-http-2-with-prior-
+	//   * 'kubernetes.io/ws'  - WebSocket over cleartext as described in https://www.rfc-editor.org/rfc/rfc6455
+	//   * 'kubernetes.io/wss' - WebSocket over TLS as described in https://www.rfc-editor.org/rfc/rfc6455
 	//
 	// * Other protocols should use implementation-defined prefixed names such as
 	// mycompany.com/my-custom-protocol.

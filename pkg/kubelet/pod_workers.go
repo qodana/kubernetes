@@ -27,9 +27,12 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/tools/record"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 	"k8s.io/klog/v2"
+	"k8s.io/kubernetes/pkg/features"
+	"k8s.io/kubernetes/pkg/kubelet/allocation"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	"k8s.io/kubernetes/pkg/kubelet/events"
 	"k8s.io/kubernetes/pkg/kubelet/eviction"
@@ -593,6 +596,9 @@ type podWorkers struct {
 	// podCache stores kubecontainer.PodStatus for all pods.
 	podCache kubecontainer.Cache
 
+	// allocationManager is used to allocate resources for pods
+	allocationManager allocation.Manager
+
 	// clock is used for testing timing
 	clock clock.PassiveClock
 }
@@ -603,6 +609,7 @@ func newPodWorkers(
 	workQueue queue.WorkQueue,
 	resyncInterval, backOffPeriod time.Duration,
 	podCache kubecontainer.Cache,
+	allocationManager allocation.Manager,
 ) PodWorkers {
 	return &podWorkers{
 		podSyncStatuses:                    map[types.UID]*podSyncStatus{},
@@ -615,6 +622,7 @@ func newPodWorkers(
 		resyncInterval:                     resyncInterval,
 		backOffPeriod:                      backOffPeriod,
 		podCache:                           podCache,
+		allocationManager:                  allocationManager,
 		clock:                              clock.RealClock{},
 	}
 }
@@ -716,19 +724,17 @@ func (p *podWorkers) IsPodForMirrorPodTerminatingByFullName(podFullName string) 
 }
 
 func isPodStatusCacheTerminal(status *kubecontainer.PodStatus) bool {
-	runningContainers := 0
-	runningSandboxes := 0
 	for _, container := range status.ContainerStatuses {
 		if container.State == kubecontainer.ContainerStateRunning {
-			runningContainers++
+			return false
 		}
 	}
 	for _, sb := range status.SandboxStatuses {
 		if sb.State == runtimeapi.PodSandboxState_SANDBOX_READY {
-			runningSandboxes++
+			return false
 		}
 	}
-	return runningContainers == 0 && runningSandboxes == 0
+	return true
 }
 
 // UpdatePod carries a configuration change or termination state to a pod. A pod is either runnable,
@@ -961,6 +967,9 @@ func (p *podWorkers) UpdatePod(options UpdatePodOptions) {
 
 	// notify the pod worker there is a pending update
 	status.pendingUpdate = &options
+	if utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScaling) {
+		status.pendingUpdate.Pod, _ = p.allocationManager.UpdatePodFromAllocation(options.Pod)
+	}
 	status.working = true
 	klog.V(4).InfoS("Notifying pod of pending update", "pod", klog.KRef(ns, name), "podUID", uid, "workType", status.WorkType())
 	select {
@@ -981,10 +990,12 @@ func calculateEffectiveGracePeriod(status *podSyncStatus, pod *v1.Pod, options *
 	// enforce the restriction that a grace period can only decrease and track whatever our value is,
 	// then ensure a calculated value is passed down to lower levels
 	gracePeriod := status.gracePeriod
+	overridden := false
 	// this value is bedrock truth - the apiserver owns telling us this value calculated by apiserver
 	if override := pod.DeletionGracePeriodSeconds; override != nil {
 		if gracePeriod == 0 || *override < gracePeriod {
 			gracePeriod = *override
+			overridden = true
 		}
 	}
 	// we allow other parts of the kubelet (namely eviction) to request this pod be terminated faster
@@ -992,12 +1003,13 @@ func calculateEffectiveGracePeriod(status *podSyncStatus, pod *v1.Pod, options *
 		if override := options.PodTerminationGracePeriodSecondsOverride; override != nil {
 			if gracePeriod == 0 || *override < gracePeriod {
 				gracePeriod = *override
+				overridden = true
 			}
 		}
 	}
 	// make a best effort to default this value to the pod's desired intent, in the event
 	// the kubelet provided no requested value (graceful termination?)
-	if gracePeriod == 0 && pod.Spec.TerminationGracePeriodSeconds != nil {
+	if !overridden && gracePeriod == 0 && pod.Spec.TerminationGracePeriodSeconds != nil {
 		gracePeriod = *pod.Spec.TerminationGracePeriodSeconds
 	}
 	// no matter what, we always supply a grace period of 1
@@ -1180,6 +1192,12 @@ func (p *podWorkers) startPodSync(podUID types.UID) (ctx context.Context, update
 	// mark the pod as started
 	status.startedAt = p.clock.Now()
 	status.mergeLastUpdate(update.Options)
+
+	// If we are admitting the pod and it is new, record the count of containers
+	// TODO: We should probably move this into syncPod and add an execution count
+	// to the syncPod arguments, and this should be recorded on the first sync.
+	// Leaving it here complicates a particularly important loop.
+	metrics.ContainersPerPodCount.Observe(float64(len(update.Options.Pod.Spec.Containers)))
 
 	return ctx, update, true, true, true
 }
@@ -1501,7 +1519,7 @@ func (p *podWorkers) completeWork(podUID types.UID, phaseTransition bool, syncEr
 		if status.pendingUpdate != nil {
 			select {
 			case p.podUpdates[podUID] <- struct{}{}:
-				klog.V(4).InfoS("Requeueing pod due to pending update", "podUID", podUID)
+				klog.V(4).InfoS("Requeuing pod due to pending update", "podUID", podUID)
 			default:
 				klog.V(4).InfoS("Pending update already queued", "podUID", podUID)
 			}
@@ -1532,7 +1550,7 @@ func (p *podWorkers) SyncKnownPods(desiredPods []*v1.Pod) map[types.UID]PodWorke
 	p.podsSynced = true
 	for uid, status := range p.podSyncStatuses {
 		// We retain the worker history of any pod that is still desired according to
-		// its UID. However, there are ]two scenarios during a sync that result in us
+		// its UID. However, there are two scenarios during a sync that result in us
 		// needing to purge the history:
 		//
 		// 1. The pod is no longer desired (the local version is orphaned)
@@ -1652,7 +1670,7 @@ func killPodNow(podWorkers PodWorkers, recorder record.EventRecorder) eviction.K
 
 		// we timeout and return an error if we don't get a callback within a reasonable time.
 		// the default timeout is relative to the grace period (we settle on 10s to wait for kubelet->runtime traffic to complete in sigkill)
-		timeout := int64(gracePeriod + (gracePeriod / 2))
+		timeout := gracePeriod + (gracePeriod / 2)
 		minTimeout := int64(10)
 		if timeout < minTimeout {
 			timeout = minTimeout

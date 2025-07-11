@@ -17,37 +17,37 @@ limitations under the License.
 package ttlafterfinished
 
 import (
-	"k8s.io/klog/v2"
 	"strings"
 	"testing"
 	"time"
 
-	batch "k8s.io/api/batch/v1"
-	v1 "k8s.io/api/core/v1"
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/klog/v2"
 	"k8s.io/klog/v2/ktesting"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 )
 
-func newJob(completionTime, failedTime metav1.Time, ttl *int32) *batch.Job {
-	j := &batch.Job{
+func newJob(completionTime, failedTime metav1.Time, ttl *int32) *batchv1.Job {
+	j := &batchv1.Job{
 		TypeMeta: metav1.TypeMeta{Kind: "Job"},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "foobar",
 			Namespace: metav1.NamespaceDefault,
 		},
-		Spec: batch.JobSpec{
+		Spec: batchv1.JobSpec{
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{"foo": "bar"},
 			},
-			Template: v1.PodTemplateSpec{
+			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{
 						"foo": "bar",
 					},
 				},
-				Spec: v1.PodSpec{
-					Containers: []v1.Container{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
 						{Image: "foo/bar"},
 					},
 				},
@@ -56,12 +56,12 @@ func newJob(completionTime, failedTime metav1.Time, ttl *int32) *batch.Job {
 	}
 
 	if !completionTime.IsZero() {
-		c := batch.JobCondition{Type: batch.JobComplete, Status: v1.ConditionTrue, LastTransitionTime: completionTime}
+		c := batchv1.JobCondition{Type: batchv1.JobComplete, Status: corev1.ConditionTrue, LastTransitionTime: completionTime}
 		j.Status.Conditions = append(j.Status.Conditions, c)
 	}
 
 	if !failedTime.IsZero() {
-		c := batch.JobCondition{Type: batch.JobFailed, Status: v1.ConditionTrue, LastTransitionTime: failedTime}
+		c := batchv1.JobCondition{Type: batchv1.JobFailed, Status: corev1.ConditionTrue, LastTransitionTime: failedTime}
 		j.Status.Conditions = append(j.Status.Conditions, c)
 	}
 
@@ -70,11 +70,6 @@ func newJob(completionTime, failedTime metav1.Time, ttl *int32) *batch.Job {
 	}
 
 	return j
-}
-
-func durationPointer(n int) *time.Duration {
-	s := time.Duration(n) * time.Second
-	return &s
 }
 
 func TestTimeLeft(t *testing.T) {
@@ -93,7 +88,7 @@ func TestTimeLeft(t *testing.T) {
 	}{
 		{
 			name:         "Error case: Job unfinished",
-			ttl:          pointer.Int32(100),
+			ttl:          ptr.To[int32](100),
 			since:        &now.Time,
 			expectErr:    true,
 			expectErrStr: "should not be cleaned up",
@@ -108,25 +103,25 @@ func TestTimeLeft(t *testing.T) {
 		{
 			name:             "Job completed now, 0s TTL",
 			completionTime:   now,
-			ttl:              pointer.Int32(0),
+			ttl:              ptr.To[int32](0),
 			since:            &now.Time,
-			expectedTimeLeft: durationPointer(0),
+			expectedTimeLeft: ptr.To(0 * time.Second),
 			expectedExpireAt: now.Time,
 		},
 		{
 			name:             "Job completed now, 10s TTL",
 			completionTime:   now,
-			ttl:              pointer.Int32(10),
+			ttl:              ptr.To[int32](10),
 			since:            &now.Time,
-			expectedTimeLeft: durationPointer(10),
+			expectedTimeLeft: ptr.To(10 * time.Second),
 			expectedExpireAt: now.Add(10 * time.Second),
 		},
 		{
 			name:             "Job completed 10s ago, 15s TTL",
 			completionTime:   metav1.NewTime(now.Add(-10 * time.Second)),
-			ttl:              pointer.Int32(15),
+			ttl:              ptr.To[int32](15),
 			since:            &now.Time,
-			expectedTimeLeft: durationPointer(5),
+			expectedTimeLeft: ptr.To(5 * time.Second),
 			expectedExpireAt: now.Add(5 * time.Second),
 		},
 		{
@@ -139,25 +134,25 @@ func TestTimeLeft(t *testing.T) {
 		{
 			name:             "Job failed now, 0s TTL",
 			failedTime:       now,
-			ttl:              pointer.Int32(0),
+			ttl:              ptr.To[int32](0),
 			since:            &now.Time,
-			expectedTimeLeft: durationPointer(0),
+			expectedTimeLeft: ptr.To(0 * time.Second),
 			expectedExpireAt: now.Time,
 		},
 		{
 			name:             "Job failed now, 10s TTL",
 			failedTime:       now,
-			ttl:              pointer.Int32(10),
+			ttl:              ptr.To[int32](10),
 			since:            &now.Time,
-			expectedTimeLeft: durationPointer(10),
+			expectedTimeLeft: ptr.To(10 * time.Second),
 			expectedExpireAt: now.Add(10 * time.Second),
 		},
 		{
 			name:             "Job failed 10s ago, 15s TTL",
 			failedTime:       metav1.NewTime(now.Add(-10 * time.Second)),
-			ttl:              pointer.Int32(15),
+			ttl:              ptr.To[int32](15),
 			since:            &now.Time,
-			expectedTimeLeft: durationPointer(5),
+			expectedTimeLeft: ptr.To(5 * time.Second),
 			expectedExpireAt: now.Add(5 * time.Second),
 		},
 	}

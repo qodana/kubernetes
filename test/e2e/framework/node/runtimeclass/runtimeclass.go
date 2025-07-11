@@ -27,7 +27,7 @@ import (
 	e2enode "k8s.io/kubernetes/test/e2e/framework/node"
 	storageutils "k8s.io/kubernetes/test/e2e/storage/utils"
 	imageutils "k8s.io/kubernetes/test/utils/image"
-	utilpointer "k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 )
 
 const (
@@ -50,12 +50,12 @@ func NewRuntimeClassPod(runtimeClassName string) *v1.Pod {
 				Command: []string{"true"},
 			}},
 			RestartPolicy:                v1.RestartPolicyNever,
-			AutomountServiceAccountToken: utilpointer.BoolPtr(false),
+			AutomountServiceAccountToken: ptr.To(false),
 		},
 	}
 }
 
-// Check if test-handler is configured by reading the configuration from container runtime config.
+// NodeSupportsPreconfiguredRuntimeClassHandler checks if test-handler is configured by reading the configuration from container runtime config.
 // If no error is returned, the container runtime is assumed to support the test-handler, otherwise an error will be returned.
 func NodeSupportsPreconfiguredRuntimeClassHandler(ctx context.Context, f *framework.Framework) error {
 	node, err := e2enode.GetRandomReadySchedulableNode(ctx, f.ClientSet)

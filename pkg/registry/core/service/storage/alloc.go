@@ -151,9 +151,7 @@ func (al *Allocators) initIPFamilyFields(after After, before Before) error {
 
 	// Do some loose pre-validation of the input.  This makes it easier in the
 	// rest of allocation code to not have to consider corner cases.
-	// TODO(thockin): when we tighten validation (e.g. to require IPs) we will
-	// need a "strict" and a "loose" form of this.
-	if el := validation.ValidateServiceClusterIPsRelatedFields(service); len(el) != 0 {
+	if el := validation.ValidateServiceClusterIPsRelatedFields(service, oldService); len(el) != 0 {
 		return errors.NewInvalid(api.Kind("Service"), service.Name, el)
 	}
 
@@ -405,7 +403,8 @@ func (al *Allocators) allocIPs(service *api.Service, toAlloc map[api.IPFamily]st
 			var allocatedIP net.IP
 			var err error
 			if utilfeature.DefaultFeatureGate.Enabled(features.MultiCIDRServiceAllocator) {
-				svcAllocator, ok := allocator.(*ipallocator.Allocator)
+				// TODO: simplify this and avoid all this duplicate code
+				svcAllocator, ok := allocator.(*ipallocator.MetaAllocator)
 				if ok {
 					allocatedIP, err = svcAllocator.AllocateNextService(service)
 				} else {
@@ -425,7 +424,8 @@ func (al *Allocators) allocIPs(service *api.Service, toAlloc map[api.IPFamily]st
 			}
 			var err error
 			if utilfeature.DefaultFeatureGate.Enabled(features.MultiCIDRServiceAllocator) {
-				svcAllocator, ok := allocator.(*ipallocator.Allocator)
+				// TODO: simplify this and avoid all this duplicate code
+				svcAllocator, ok := allocator.(*ipallocator.MetaAllocator)
 				if ok {
 					err = svcAllocator.AllocateService(service, parsedIP)
 				} else {

@@ -72,7 +72,7 @@ func TestSetEnvLocal(t *testing.T) {
 	err = opts.RunEnv()
 	assert.NoError(t, err)
 	if bufErr.Len() > 0 {
-		t.Errorf("unexpected error: %s", string(bufErr.String()))
+		t.Errorf("unexpected error: %s", bufErr.String())
 	}
 	if !strings.Contains(buf.String(), "replicationcontroller/cassandra") {
 		t.Errorf("did not set env: %s", buf.String())
@@ -109,7 +109,7 @@ func TestSetEnvLocalNamespace(t *testing.T) {
 	err = opts.RunEnv()
 	assert.NoError(t, err)
 	if bufErr.Len() > 0 {
-		t.Errorf("unexpected error: %s", string(bufErr.String()))
+		t.Errorf("unexpected error: %s", bufErr.String())
 	}
 	if !strings.Contains(buf.String(), "namespace: existing-ns") {
 		t.Errorf("did not set env: %s", buf.String())
@@ -146,7 +146,7 @@ func TestSetMultiResourcesEnvLocal(t *testing.T) {
 	err = opts.RunEnv()
 	assert.NoError(t, err)
 	if bufErr.Len() > 0 {
-		t.Errorf("unexpected error: %s", string(bufErr.String()))
+		t.Errorf("unexpected error: %s", bufErr.String())
 	}
 	expectedOut := "replicationcontroller/first-rc\nreplicationcontroller/second-rc\n"
 	if buf.String() != expectedOut {
@@ -503,7 +503,7 @@ func TestSetEnvRemote(t *testing.T) {
 						if err != nil {
 							return nil, err
 						}
-						assert.Contains(t, string(bytes), `"value":`+`"`+"prod"+`"`, fmt.Sprintf("env not updated for %#v", input.object))
+						assert.Containsf(t, string(bytes), `"value":`+`"`+"prod"+`"`, "env not updated for %#v", input.object)
 						return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: objBody(input.object)}, nil
 					default:
 						t.Errorf("%s: unexpected request: %s %#v\n%#v", "image", req.Method, req.URL, req)

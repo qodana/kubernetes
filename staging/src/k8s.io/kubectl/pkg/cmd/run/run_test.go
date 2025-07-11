@@ -262,7 +262,7 @@ func TestGenerateService(t *testing.T) {
 						{
 							Port:       80,
 							Protocol:   "TCP",
-							TargetPort: intstr.FromInt(80),
+							TargetPort: intstr.FromInt32(80),
 						},
 					},
 					Selector: map[string]string{
@@ -295,7 +295,7 @@ func TestGenerateService(t *testing.T) {
 						{
 							Port:       80,
 							Protocol:   "TCP",
-							TargetPort: intstr.FromInt(80),
+							TargetPort: intstr.FromInt32(80),
 						},
 					},
 					Selector: map[string]string{
@@ -655,7 +655,6 @@ func TestRunOverride(t *testing.T) {
 			expectedOutput: `apiVersion: v1
 kind: Pod
 metadata:
-  creationTimestamp: null
   labels:
     run: test
   name: test
@@ -678,7 +677,6 @@ status: {}
 			expectedOutput: `apiVersion: v1
 kind: Pod
 metadata:
-  creationTimestamp: null
   labels:
     run: test
   name: test
@@ -701,7 +699,6 @@ status: {}
 			expectedOutput: `apiVersion: v1
 kind: Pod
 metadata:
-  creationTimestamp: null
   labels:
     run: test
   name: test
@@ -729,7 +726,6 @@ status: {}
 			expectedOutput: `apiVersion: v1
 kind: Pod
 metadata:
-  creationTimestamp: null
   labels:
     foo: bar
     run: test

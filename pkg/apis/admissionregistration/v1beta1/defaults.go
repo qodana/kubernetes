@@ -20,11 +20,35 @@ import (
 	admissionregistrationv1beta1 "k8s.io/api/admissionregistration/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	utilpointer "k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 )
 
 func addDefaultingFuncs(scheme *runtime.Scheme) error {
 	return RegisterDefaults(scheme)
+}
+
+// SetDefaults_ValidatingAdmissionPolicySpec sets defaults for ValidatingAdmissionPolicySpec
+func SetDefaults_ValidatingAdmissionPolicySpec(obj *admissionregistrationv1beta1.ValidatingAdmissionPolicySpec) {
+	if obj.FailurePolicy == nil {
+		policy := admissionregistrationv1beta1.Fail
+		obj.FailurePolicy = &policy
+	}
+}
+
+// SetDefaults_MatchResources sets defaults for MatchResources
+func SetDefaults_MatchResources(obj *admissionregistrationv1beta1.MatchResources) {
+	if obj.MatchPolicy == nil {
+		policy := admissionregistrationv1beta1.Equivalent
+		obj.MatchPolicy = &policy
+	}
+	if obj.NamespaceSelector == nil {
+		selector := metav1.LabelSelector{}
+		obj.NamespaceSelector = &selector
+	}
+	if obj.ObjectSelector == nil {
+		selector := metav1.LabelSelector{}
+		obj.ObjectSelector = &selector
+	}
 }
 
 // SetDefaults_ValidatingWebhook sets defaults for webhook validating
@@ -100,6 +124,6 @@ func SetDefaults_MutatingWebhook(obj *admissionregistrationv1beta1.MutatingWebho
 // SetDefaults_ServiceReference sets defaults for Webhook's ServiceReference
 func SetDefaults_ServiceReference(obj *admissionregistrationv1beta1.ServiceReference) {
 	if obj.Port == nil {
-		obj.Port = utilpointer.Int32(443)
+		obj.Port = ptr.To[int32](443)
 	}
 }

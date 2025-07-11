@@ -32,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/kubernetes/pkg/kubelet/allocation"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	containertest "k8s.io/kubernetes/pkg/kubelet/container/testing"
 	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
@@ -220,10 +221,10 @@ func (q *fakeQueue) Items() []FakeQueueItem {
 	return append(make([]FakeQueueItem, 0, len(q.queue)), q.queue...)
 }
 
-func (q *fakeQueue) Set() sets.String {
+func (q *fakeQueue) Set() sets.Set[string] {
 	q.lock.Lock()
 	defer q.lock.Unlock()
-	work := sets.NewString()
+	work := sets.New[string]()
 	for _, item := range q.queue[q.currentStart:] {
 		work.Insert(string(item.UID))
 	}
@@ -451,6 +452,7 @@ func createPodWorkers() (*podWorkers, *containertest.FakeRuntime, map[types.UID]
 		time.Second,
 		time.Millisecond,
 		fakeCache,
+		allocation.NewInMemoryManager(nil, nil, nil, nil, nil, nil),
 	)
 	workers := w.(*podWorkers)
 	workers.clock = clock
@@ -476,7 +478,7 @@ func drainWorkers(podWorkers *podWorkers, numPods int) {
 }
 
 func drainWorkersExcept(podWorkers *podWorkers, uids ...types.UID) {
-	set := sets.NewString()
+	set := sets.New[string]()
 	for _, uid := range uids {
 		set.Insert(string(uid))
 	}
@@ -982,8 +984,8 @@ func TestUpdatePodDoesNotForgetSyncPodKill(t *testing.T) {
 	}
 }
 
-func newUIDSet(uids ...types.UID) sets.String {
-	set := sets.NewString()
+func newUIDSet(uids ...types.UID) sets.Set[string] {
+	set := sets.New[string]()
 	for _, uid := range uids {
 		set.Insert(string(uid))
 	}
@@ -993,7 +995,7 @@ func newUIDSet(uids ...types.UID) sets.String {
 type terminalPhaseSync struct {
 	lock     sync.Mutex
 	fn       syncPodFnType
-	terminal sets.String
+	terminal sets.Set[string]
 }
 
 func (s *terminalPhaseSync) SyncPod(ctx context.Context, updateType kubetypes.SyncPodType, pod *v1.Pod, mirrorPod *v1.Pod, podStatus *kubecontainer.PodStatus) (bool, error) {
@@ -1018,7 +1020,7 @@ func (s *terminalPhaseSync) SetTerminal(uid types.UID) {
 func newTerminalPhaseSync(fn syncPodFnType) *terminalPhaseSync {
 	return &terminalPhaseSync{
 		fn:       fn,
-		terminal: sets.NewString(),
+		terminal: sets.New[string](),
 	}
 }
 
@@ -1171,7 +1173,7 @@ func TestStaticPodExclusion(t *testing.T) {
 		t.Fatalf("unexpected waiting static pods: %s", cmp.Diff(e, a))
 	}
 	// verify all are enqueued
-	if e, a := sets.NewString("1-normal", "2-static", "4-static", "3-static"), podWorkers.workQueue.(*fakeQueue).Set(); !e.Equal(a) {
+	if e, a := sets.New[string]("1-normal", "2-static", "4-static", "3-static"), podWorkers.workQueue.(*fakeQueue).Set(); !e.Equal(a) {
 		t.Fatalf("unexpected queued items: %s", cmp.Diff(e, a))
 	}
 
@@ -1191,7 +1193,7 @@ func TestStaticPodExclusion(t *testing.T) {
 		t.Fatalf("unexpected waiting static pods: %s", cmp.Diff(e, a))
 	}
 	// the queue should include a single item for 3-static (indicating we need to retry later)
-	if e, a := sets.NewString("3-static"), newUIDSet(podWorkers.workQueue.GetWork()...); !reflect.DeepEqual(e, a) {
+	if e, a := sets.New[string]("3-static"), newUIDSet(podWorkers.workQueue.GetWork()...); !reflect.DeepEqual(e, a) {
 		t.Fatalf("unexpected queued items: %s", cmp.Diff(e, a))
 	}
 
@@ -1209,7 +1211,7 @@ func TestStaticPodExclusion(t *testing.T) {
 		t.Fatalf("unexpected pod state: %#v", pod3)
 	}
 	// the queue should be empty because the worker is now done
-	if e, a := sets.NewString(), newUIDSet(podWorkers.workQueue.GetWork()...); !reflect.DeepEqual(e, a) {
+	if e, a := sets.New[string](), newUIDSet(podWorkers.workQueue.GetWork()...); !reflect.DeepEqual(e, a) {
 		t.Fatalf("unexpected queued items: %s", cmp.Diff(e, a))
 	}
 	// 2-static is still running
@@ -1940,7 +1942,13 @@ func TestFakePodWorkers(t *testing.T) {
 
 	realPodWorkers := newPodWorkers(
 		realPodSyncer,
-		fakeRecorder, queue.NewBasicWorkQueue(&clock.RealClock{}), time.Second, time.Second, fakeCache)
+		fakeRecorder,
+		queue.NewBasicWorkQueue(&clock.RealClock{}),
+		time.Second,
+		time.Second,
+		fakeCache,
+		allocation.NewInMemoryManager(nil, nil, nil, nil, nil, nil),
+	)
 	fakePodWorkers := &fakePodWorkers{
 		syncPodFn: kubeletForFakeWorkers.SyncPod,
 		cache:     fakeCache,
@@ -2378,6 +2386,66 @@ func Test_allowPodStart(t *testing.T) {
 						tc.expectedWaitingToStartStaticPodsByFullname,
 						podWorkers.waitingToStartStaticPodsByFullname)
 				}
+			}
+		})
+	}
+}
+
+func Test_calculateEffectiveGracePeriod(t *testing.T) {
+	zero := int64(0)
+	two := int64(2)
+	five := int64(5)
+	thirty := int64(30)
+	testCases := []struct {
+		desc                                 string
+		podSpecTerminationGracePeriodSeconds *int64
+		podDeletionGracePeriodSeconds        *int64
+		gracePeriodOverride                  *int64
+		expectedGracePeriod                  int64
+	}{
+		{
+			desc:                                 "use termination grace period from the spec when no overrides",
+			podSpecTerminationGracePeriodSeconds: &thirty,
+			expectedGracePeriod:                  thirty,
+		},
+		{
+			desc:                                 "use pod DeletionGracePeriodSeconds when set",
+			podSpecTerminationGracePeriodSeconds: &thirty,
+			podDeletionGracePeriodSeconds:        &five,
+			expectedGracePeriod:                  five,
+		},
+		{
+			desc:                                 "use grace period override when set",
+			podSpecTerminationGracePeriodSeconds: &thirty,
+			podDeletionGracePeriodSeconds:        &five,
+			gracePeriodOverride:                  &two,
+			expectedGracePeriod:                  two,
+		},
+		{
+			desc:                                 "use 1 when pod DeletionGracePeriodSeconds is zero",
+			podSpecTerminationGracePeriodSeconds: &thirty,
+			podDeletionGracePeriodSeconds:        &zero,
+			expectedGracePeriod:                  1,
+		},
+		{
+			desc:                                 "use 1 when grace period override is zero",
+			podSpecTerminationGracePeriodSeconds: &thirty,
+			podDeletionGracePeriodSeconds:        &five,
+			gracePeriodOverride:                  &zero,
+			expectedGracePeriod:                  1,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			pod := newNamedPod("1", "ns", "running-pod", false)
+			pod.Spec.TerminationGracePeriodSeconds = tc.podSpecTerminationGracePeriodSeconds
+			pod.DeletionGracePeriodSeconds = tc.podDeletionGracePeriodSeconds
+			gracePeriod, _ := calculateEffectiveGracePeriod(&podSyncStatus{}, pod, &KillPodOptions{
+				PodTerminationGracePeriodSecondsOverride: tc.gracePeriodOverride,
+			})
+			if gracePeriod != tc.expectedGracePeriod {
+				t.Errorf("Expected a grace period of %v, but was %v", tc.expectedGracePeriod, gracePeriod)
 			}
 		})
 	}

@@ -46,6 +46,7 @@ import (
 	kubeapiservertesting "k8s.io/kubernetes/cmd/kube-apiserver/app/testing"
 	"k8s.io/kubernetes/test/integration"
 	"k8s.io/kubernetes/test/integration/framework"
+	"k8s.io/kubernetes/test/utils/ktesting"
 )
 
 const (
@@ -55,7 +56,7 @@ const (
 )
 
 func testPrefix(t *testing.T, prefix string) {
-	server := kubeapiservertesting.StartTestServerOrDie(t, nil, nil, framework.SharedEtcd())
+	server := kubeapiservertesting.StartTestServerOrDie(t, nil, framework.DefaultTestServerFlags(), framework.SharedEtcd())
 	defer server.TearDownFn()
 
 	transport, err := restclient.TransportFor(server.ClientConfig)
@@ -108,7 +109,7 @@ func TestKubernetesService(t *testing.T) {
 }
 
 func TestEmptyList(t *testing.T) {
-	server := kubeapiservertesting.StartTestServerOrDie(t, nil, nil, framework.SharedEtcd())
+	server := kubeapiservertesting.StartTestServerOrDie(t, nil, framework.DefaultTestServerFlags(), framework.SharedEtcd())
 	defer server.TearDownFn()
 
 	transport, err := restclient.TransportFor(server.ClientConfig)
@@ -189,7 +190,8 @@ func TestStatus(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, kubeConfig, tearDownFn := framework.StartTestServer(t, framework.TestServerSetup{
+			tCtx := ktesting.Init(t)
+			_, kubeConfig, tearDownFn := framework.StartTestServer(tCtx, t, framework.TestServerSetup{
 				ModifyServerRunOptions: func(options *options.ServerRunOptions) {
 					if tc.modifyOptions != nil {
 						tc.modifyOptions(options)
@@ -336,7 +338,7 @@ func TestObjectSizeResponses(t *testing.T) {
 	expectedMsgFor1MB := `etcdserver: request is too large`
 	expectedMsgFor2MB := `rpc error: code = ResourceExhausted desc = trying to send message larger than max`
 	expectedMsgFor3MB := `Request entity too large: limit is 3145728`
-	expectedMsgForLargeAnnotation := `metadata.annotations: Too long: must have at most 262144 bytes`
+	expectedMsgForLargeAnnotation := `metadata.annotations: Too long: may not be more than 262144 bytes`
 
 	deployment1 := constructBody("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", DeploymentMegabyteSize, "labels", t)      // >1.5 MB file
 	deployment2 := constructBody("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", DeploymentTwoMegabyteSize, "labels", t)   // >2 MB file
@@ -378,7 +380,7 @@ func TestObjectSizeResponses(t *testing.T) {
 }
 
 func TestWatchSucceedsWithoutArgs(t *testing.T) {
-	server := kubeapiservertesting.StartTestServerOrDie(t, nil, nil, framework.SharedEtcd())
+	server := kubeapiservertesting.StartTestServerOrDie(t, nil, framework.DefaultTestServerFlags(), framework.SharedEtcd())
 	defer server.TearDownFn()
 
 	transport, err := restclient.TransportFor(server.ClientConfig)
@@ -469,7 +471,7 @@ func appsPath(resource, namespace, name string) string {
 }
 
 func TestAutoscalingGroupBackwardCompatibility(t *testing.T) {
-	server := kubeapiservertesting.StartTestServerOrDie(t, nil, nil, framework.SharedEtcd())
+	server := kubeapiservertesting.StartTestServerOrDie(t, nil, framework.DefaultTestServerFlags(), framework.SharedEtcd())
 	defer server.TearDownFn()
 
 	transport, err := restclient.TransportFor(server.ClientConfig)
@@ -518,7 +520,7 @@ func TestAutoscalingGroupBackwardCompatibility(t *testing.T) {
 }
 
 func TestAppsGroupBackwardCompatibility(t *testing.T) {
-	server := kubeapiservertesting.StartTestServerOrDie(t, nil, nil, framework.SharedEtcd())
+	server := kubeapiservertesting.StartTestServerOrDie(t, nil, framework.DefaultTestServerFlags(), framework.SharedEtcd())
 	defer server.TearDownFn()
 
 	transport, err := restclient.TransportFor(server.ClientConfig)
@@ -570,7 +572,7 @@ func TestAppsGroupBackwardCompatibility(t *testing.T) {
 }
 
 func TestAccept(t *testing.T) {
-	server := kubeapiservertesting.StartTestServerOrDie(t, nil, nil, framework.SharedEtcd())
+	server := kubeapiservertesting.StartTestServerOrDie(t, nil, framework.DefaultTestServerFlags(), framework.SharedEtcd())
 	defer server.TearDownFn()
 
 	transport, err := restclient.TransportFor(server.ClientConfig)

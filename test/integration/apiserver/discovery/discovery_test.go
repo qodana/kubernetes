@@ -27,7 +27,8 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/require"
-	apidiscoveryv2beta1 "k8s.io/api/apidiscovery/v2beta1"
+
+	apidiscoveryv2 "k8s.io/api/apidiscovery/v2"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apiextensions "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -36,14 +37,12 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	runtimeserializer "k8s.io/apimachinery/pkg/runtime/serializer"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/sets"
 	discoveryendpoint "k8s.io/apiserver/pkg/endpoints/discovery/aggregated"
-	genericfeatures "k8s.io/apiserver/pkg/features"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	kubernetes "k8s.io/client-go/kubernetes"
 	k8sscheme "k8s.io/client-go/kubernetes/scheme"
-	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	apiregistrationv1 "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
 	aggregator "k8s.io/kube-aggregator/pkg/client/clientset_generated/clientset"
 	aggregatorclientsetscheme "k8s.io/kube-aggregator/pkg/client/clientset_generated/clientset/scheme"
@@ -52,16 +51,12 @@ import (
 	"k8s.io/kubernetes/test/integration/framework"
 )
 
-//lint:ignore U1000 we need to alias only for the sake of embedding
 type kubeClientSet = kubernetes.Interface
 
-//lint:ignore U1000 we need to alias only for the sake of embedding
 type aggegatorClientSet = aggregator.Interface
 
-//lint:ignore U1000 we need to alias only for the sake of embedding
 type apiextensionsClientSet = apiextensions.Interface
 
-//lint:ignore U1000 we need to alias only for the sake of embedding
 type dynamicClientset = dynamic.Interface
 type testClientSet struct {
 	kubeClientSet
@@ -81,14 +76,14 @@ var (
 	codecs    = runtimeserializer.NewCodecFactory(scheme)
 	serialize runtime.NegotiatedSerializer
 
-	basicTestGroup = apidiscoveryv2beta1.APIGroupDiscovery{
+	basicTestGroup = apidiscoveryv2.APIGroupDiscovery{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "stable.example.com",
 		},
-		Versions: []apidiscoveryv2beta1.APIVersionDiscovery{
+		Versions: []apidiscoveryv2.APIVersionDiscovery{
 			{
 				Version: "v1",
-				Resources: []apidiscoveryv2beta1.APIResourceDiscovery{
+				Resources: []apidiscoveryv2.APIResourceDiscovery{
 					{
 						Resource:   "jobs",
 						Verbs:      []string{"create", "list", "watch", "delete"},
@@ -96,7 +91,41 @@ var (
 						Categories: []string{"all"},
 					},
 				},
-				Freshness: apidiscoveryv2beta1.DiscoveryFreshnessCurrent,
+				Freshness: apidiscoveryv2.DiscoveryFreshnessCurrent,
+			},
+		},
+	}
+
+	basicTestGroupWithFixup = apidiscoveryv2.APIGroupDiscovery{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "stable.example.com",
+		},
+		Versions: []apidiscoveryv2.APIVersionDiscovery{
+			{
+				Version: "v1",
+				Resources: []apidiscoveryv2.APIResourceDiscovery{
+					{
+						Resource:   "jobs",
+						Verbs:      []string{"create", "list", "watch", "delete"},
+						ShortNames: []string{"jz"},
+						Categories: []string{"all"},
+						// aggregator will populate this with a non-nil value
+						ResponseKind: &metav1.GroupVersionKind{},
+					},
+				},
+				Freshness: apidiscoveryv2.DiscoveryFreshnessCurrent,
+			},
+		},
+	}
+
+	basicTestGroupStale = apidiscoveryv2.APIGroupDiscovery{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "stable.example.com",
+		},
+		Versions: []apidiscoveryv2.APIVersionDiscovery{
+			{
+				Version:   "v1",
+				Freshness: apidiscoveryv2.DiscoveryFreshnessStale,
 			},
 		},
 	}
@@ -128,7 +157,7 @@ func init() {
 func setup(t *testing.T) (context.Context, testClientSet, context.CancelFunc) {
 	ctx, cancelCtx := context.WithCancel(context.Background())
 
-	server := kubeapiservertesting.StartTestServerOrDie(t, nil, nil, framework.SharedEtcd())
+	server := kubeapiservertesting.StartTestServerOrDie(t, nil, framework.DefaultTestServerFlags(), framework.SharedEtcd())
 	t.Cleanup(server.TearDownFn)
 
 	kubeClientSet, err := kubernetes.NewForConfig(server.ClientConfig)
@@ -150,6 +179,64 @@ func setup(t *testing.T) (context.Context, testClientSet, context.CancelFunc) {
 		dynamicClientset:       dynamicClientset,
 	}
 	return ctx, client, cancelCtx
+}
+
+func TestReadinessAggregatedAPIServiceDiscovery(t *testing.T) {
+	// Keep any goroutines spawned from running past the execution of this test
+	ctx, client, cleanup := setup(t)
+	defer cleanup()
+
+	// Create a resource manager whichs serves our GroupVersion
+	resourceManager := discoveryendpoint.NewResourceManager("apis")
+	resourceManager.SetGroups([]apidiscoveryv2.APIGroupDiscovery{basicTestGroup})
+
+	apiServiceWaitCh := make(chan struct{})
+
+	// Install our ResourceManager as an Aggregated APIService to the
+	// test server
+	service := NewFakeService("test-server", client, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/apis/stable.example.com") {
+			// Return invalid response so APIService can be marked as "available"
+			w.WriteHeader(http.StatusOK)
+		} else if strings.HasPrefix(r.URL.Path, "/apis") {
+			select {
+			case <-apiServiceWaitCh:
+				// Hang responding to discovery until aggregated discovery document contains the aggregated group marked as Stale.
+				resourceManager.ServeHTTP(w, r)
+			case <-ctx.Done():
+				return
+			}
+		} else {
+			// reject openapi/v2, openapi/v3, apis/<group>/<version>
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	go func() {
+		if err := service.Run(ctx); err != nil {
+			t.Errorf("unexpected error %v", err)
+		}
+	}()
+	require.NoError(t, service.WaitForReady(ctx))
+
+	// For each groupversion served by our resourcemanager, create an APIService
+	// object connected to our fake APIServer
+	for _, versionInfo := range basicTestGroup.Versions {
+		groupVersion := metav1.GroupVersion{
+			Group:   basicTestGroup.Name,
+			Version: versionInfo.Version,
+		}
+
+		require.NoError(t, registerAPIService(ctx, client, groupVersion, service))
+	}
+
+	// Keep repeatedly fetching document from aggregator.
+	// Check to see if it initially contains the aggregated group as stale
+	require.NoError(t, WaitForGroups(ctx, client, basicTestGroupStale))
+	require.NoError(t, WaitForRootPaths(t, ctx, client, sets.New("/apis/"+basicTestGroup.Name), nil))
+
+	// Allow the APIService to start responding and ensure that Freshness is updated when the APIService is reacheable.
+	close(apiServiceWaitCh)
+	require.NoError(t, WaitForGroups(ctx, client, basicTestGroupWithFixup))
 }
 
 func registerAPIService(ctx context.Context, client aggregator.Interface, gv metav1.GroupVersion, service FakeService) error {
@@ -192,15 +279,13 @@ func unregisterAPIService(ctx context.Context, client aggregator.Interface, gv m
 }
 
 func TestAggregatedAPIServiceDiscovery(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.AggregatedDiscoveryEndpoint, true)()
-
 	// Keep any goroutines spawned from running past the execution of this test
 	ctx, client, cleanup := setup(t)
 	defer cleanup()
 
 	// Create a resource manager whichs serves our GroupVersion
 	resourceManager := discoveryendpoint.NewResourceManager("apis")
-	resourceManager.SetGroups([]apidiscoveryv2beta1.APIGroupDiscovery{basicTestGroup})
+	resourceManager.SetGroups([]apidiscoveryv2.APIGroupDiscovery{basicTestGroup})
 
 	// Install our ResourceManager as an Aggregated APIService to the
 	// test server
@@ -216,12 +301,15 @@ func TestAggregatedAPIServiceDiscovery(t *testing.T) {
 		}
 	}))
 	go func() {
-		require.NoError(t, service.Run(ctx))
+		if err := service.Run(ctx); err != nil {
+			t.Errorf("unexpected error %v", err)
+		}
 	}()
 	require.NoError(t, service.WaitForReady(ctx))
 
 	// For each groupversion served by our resourcemanager, create an APIService
 	// object connected to our fake APIServer
+	var groupVersions []metav1.GroupVersion
 	for _, versionInfo := range basicTestGroup.Versions {
 		groupVersion := metav1.GroupVersion{
 			Group:   basicTestGroup.Name,
@@ -229,14 +317,19 @@ func TestAggregatedAPIServiceDiscovery(t *testing.T) {
 		}
 
 		require.NoError(t, registerAPIService(ctx, client, groupVersion, service))
-		defer func() {
-			require.NoError(t, unregisterAPIService(ctx, client, groupVersion))
-		}()
+		groupVersions = append(groupVersions, groupVersion)
 	}
 
 	// Keep repeatedly fetching document from aggregator.
 	// Check to see if it contains our service within a reasonable amount of time
-	require.NoError(t, WaitForGroups(ctx, client, basicTestGroup))
+	require.NoError(t, WaitForGroups(ctx, client, basicTestGroupWithFixup))
+	require.NoError(t, WaitForRootPaths(t, ctx, client, sets.New("/apis/"+basicTestGroup.Name), nil))
+
+	// Unregister and ensure the group gets dropped from root paths
+	for _, groupVersion := range groupVersions {
+		require.NoError(t, unregisterAPIService(ctx, client, groupVersion))
+	}
+	require.NoError(t, WaitForRootPaths(t, ctx, client, nil, sets.New("/apis/"+basicTestGroup.Name)))
 }
 
 func runTestCases(t *testing.T, cases []testCase) {
@@ -275,7 +368,7 @@ func runTestCases(t *testing.T, cases []testCase) {
 			})
 			require.NoError(t, err, "v1 discovery must reset between tests: "+diff)
 
-			err = WaitForResultWithCondition(ctx, client, func(result apidiscoveryv2beta1.APIGroupDiscoveryList) bool {
+			err = WaitForResultWithCondition(ctx, client, func(result apidiscoveryv2.APIGroupDiscoveryList) bool {
 				diff = cmp.Diff(originalV2, result)
 				return reflect.DeepEqual(result, originalV2)
 			})
@@ -286,8 +379,6 @@ func runTestCases(t *testing.T, cases []testCase) {
 
 // Declarative tests targeting CRD integration
 func TestCRD(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.AggregatedDiscoveryEndpoint, true)()
-
 	runTestCases(t, []testCase{
 		{
 			// Show that when a CRD is added it gets included on the discovery doc
@@ -519,8 +610,6 @@ func TestCRD(t *testing.T) {
 }
 
 func TestFreshness(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.AggregatedDiscoveryEndpoint, true)()
-
 	requireStaleGVs := func(gvs ...metav1.GroupVersion) inlineAction {
 		return inlineAction(func(ctx context.Context, client testClient) error {
 			document, err := FetchV2Discovery(ctx, client)
@@ -539,9 +628,9 @@ func TestFreshness(t *testing.T) {
 				}
 
 				switch entry.Freshness {
-				case apidiscoveryv2beta1.DiscoveryFreshnessCurrent:
+				case apidiscoveryv2.DiscoveryFreshnessCurrent:
 					// Skip
-				case apidiscoveryv2beta1.DiscoveryFreshnessStale:
+				case apidiscoveryv2.DiscoveryFreshnessStale:
 					staleGVs = append(staleGVs, targetGv)
 				default:
 					return fmt.Errorf("unrecognized freshness '%v' on gv '%v'", entry.Freshness, targetGv)
@@ -608,9 +697,7 @@ func TestFreshness(t *testing.T) {
 
 // Shows a group for which multiple APIServices specify a GroupPriorityMinimum,
 // it is sorted the same in both versions of discovery
-func TestGroupPriorty(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.AggregatedDiscoveryEndpoint, true)()
-
+func TestGroupPriority(t *testing.T) {
 	makeApiServiceSpec := func(gv metav1.GroupVersion, groupPriorityMin, versionPriority int) apiregistrationv1.APIServiceSpec {
 		return apiregistrationv1.APIServiceSpec{
 			Group:                 gv.Group,

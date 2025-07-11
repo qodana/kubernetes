@@ -34,6 +34,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/cli-runtime/pkg/printers"
 	"k8s.io/kubernetes/pkg/cluster/ports"
+	"k8s.io/kubernetes/test/e2e/feature"
 	"k8s.io/kubernetes/test/e2e/framework"
 	imageutils "k8s.io/kubernetes/test/utils/image"
 	admissionapi "k8s.io/pod-security-admission/api"
@@ -44,9 +45,9 @@ import (
 	testutils "k8s.io/kubernetes/test/utils"
 )
 
-var _ = SIGDescribe("[Feature:StandaloneMode] ", func() {
+var _ = SIGDescribe(feature.StandaloneMode, func() {
 	f := framework.NewDefaultFramework("static-pod")
-	f.NamespacePodSecurityEnforceLevel = admissionapi.LevelBaseline
+	f.NamespacePodSecurityLevel = admissionapi.LevelBaseline
 	ginkgo.Context("when creating a static pod", func() {
 		var ns, podPath, staticPodName string
 
@@ -55,18 +56,18 @@ var _ = SIGDescribe("[Feature:StandaloneMode] ", func() {
 			staticPodName = "static-pod-" + string(uuid.NewUUID())
 			podPath = kubeletCfg.StaticPodPath
 
-			err := createBasicStaticPod(podPath, staticPodName, ns)
+			err := scheduleStaticPod(podPath, staticPodName, ns, createBasicStaticPodSpec(staticPodName, ns))
 			framework.ExpectNoError(err)
 
 			gomega.Eventually(ctx, func(ctx context.Context) error {
 				pod, err := getPodFromStandaloneKubelet(ctx, ns, staticPodName)
 				if err != nil {
-					return fmt.Errorf("error getting pod(%v/%v) from standalone kubelet: %v", ns, staticPodName, err)
+					return fmt.Errorf("error getting pod(%v/%v) from standalone kubelet: %w", ns, staticPodName, err)
 				}
 
 				isReady, err := testutils.PodRunningReady(pod)
 				if err != nil {
-					return fmt.Errorf("error checking if pod (%v/%v) is running ready: %v", ns, staticPodName, err)
+					return fmt.Errorf("error checking if pod (%v/%v) is running ready: %w", ns, staticPodName, err)
 				}
 				if !isReady {
 					return fmt.Errorf("pod (%v/%v) is not running", ns, staticPodName)
@@ -74,6 +75,124 @@ var _ = SIGDescribe("[Feature:StandaloneMode] ", func() {
 				return nil
 			}, f.Timeouts.PodStart, time.Second*5).Should(gomega.BeNil())
 		})
+
+		ginkgo.It("the pod with the port on host network should be running and can be upgraded when the container name changes", func(ctx context.Context) {
+			ns = f.Namespace.Name
+			staticPodName = "static-pod-" + string(uuid.NewUUID())
+			podPath = kubeletCfg.StaticPodPath
+
+			podSpec := createBasicStaticPodSpec(staticPodName, ns)
+			podSpec.Spec.HostNetwork = true
+			podSpec.Spec.Containers[0].Ports = []v1.ContainerPort{
+				{
+					Name:          "tcp",
+					ContainerPort: 4534,
+					Protocol:      v1.ProtocolTCP,
+				},
+			}
+			err := scheduleStaticPod(podPath, staticPodName, ns, podSpec)
+			framework.ExpectNoError(err)
+
+			gomega.Eventually(ctx, func(ctx context.Context) error {
+				pod, err := getPodFromStandaloneKubelet(ctx, ns, staticPodName)
+				if err != nil {
+					return fmt.Errorf("error getting pod(%v/%v) from standalone kubelet: %w", ns, staticPodName, err)
+				}
+
+				isReady, err := testutils.PodRunningReady(pod)
+				if err != nil {
+					return fmt.Errorf("error checking if pod (%v/%v) is running ready: %w", ns, staticPodName, err)
+				}
+				if !isReady {
+					return fmt.Errorf("pod (%v/%v) is not running", ns, staticPodName)
+				}
+				return nil
+			}, f.Timeouts.PodStart, time.Second*5).Should(gomega.BeNil())
+
+			// Upgrade the pod
+			podSpec.Spec.Containers[0].Name = "upgraded"
+			err = scheduleStaticPod(podPath, staticPodName, ns, podSpec)
+			framework.ExpectNoError(err)
+
+			gomega.Eventually(ctx, func(ctx context.Context) error {
+				pod, err := getPodFromStandaloneKubelet(ctx, ns, staticPodName)
+				if err != nil {
+					return fmt.Errorf("error getting pod(%v/%v) from standalone kubelet: %w", ns, staticPodName, err)
+				}
+
+				if pod.Spec.Containers[0].Name != "upgraded" {
+					return fmt.Errorf("pod (%v/%v) is not upgraded", ns, staticPodName)
+				}
+
+				isReady, err := testutils.PodRunningReady(pod)
+				if err != nil {
+					return fmt.Errorf("error checking if pod (%v/%v) is running ready: %w", ns, staticPodName, err)
+				}
+				if !isReady {
+					return fmt.Errorf("pod (%v/%v) is not running", ns, staticPodName)
+				}
+				return nil
+			}, f.Timeouts.PodStart, time.Second*5).Should(gomega.BeNil())
+		})
+
+		// the test below is not working - pod update fails with the "Predicate NodePorts failed: node(s) didn't have free ports for the requested pod ports"
+		// ginkgo.It("the pod with the port on host network should be running and can be upgraded when namespace of a Pod changes", func(ctx context.Context) {
+		// 	ns = f.Namespace.Name
+		// 	staticPodName = "static-pod-" + string(uuid.NewUUID())
+		// 	podPath = kubeletCfg.StaticPodPath
+
+		// 	podSpec := createBasicStaticPodSpec(staticPodName, ns)
+		// 	podSpec.Spec.HostNetwork = true
+		// 	podSpec.Spec.Containers[0].Ports = []v1.ContainerPort{
+		// 		{
+		// 			Name:          "tcp",
+		// 			ContainerPort: 4534,
+		// 			Protocol:      v1.ProtocolTCP,
+		// 		},
+		// 	}
+		// 	err := scheduleStaticPod(podPath, staticPodName, ns, podSpec)
+		// 	framework.ExpectNoError(err)
+
+		// 	gomega.Eventually(ctx, func(ctx context.Context) error {
+		// 		pod, err := getPodFromStandaloneKubelet(ctx, ns, staticPodName)
+		// 		if err != nil {
+		// 			return fmt.Errorf("error getting pod(%v/%v) from standalone kubelet: %w", ns, staticPodName, err)
+		// 		}
+
+		// 		isReady, err := testutils.PodRunningReady(pod)
+		// 		if err != nil {
+		// 			return fmt.Errorf("error checking if pod (%v/%v) is running ready: %w", ns, staticPodName, err)
+		// 		}
+		// 		if !isReady {
+		// 			return fmt.Errorf("pod (%v/%v) is not running", ns, staticPodName)
+		// 		}
+		// 		return nil
+		// 	}, f.Timeouts.PodStart, time.Second*5).Should(gomega.BeNil())
+
+		// 	// Upgrade the pod
+		// 	upgradedNs := ns + "-upgraded"
+		// 	podSpec.Namespace = upgradedNs
+
+		// 	// use old namespace as it uses ns in a file name
+		// 	err = scheduleStaticPod(podPath, staticPodName, ns, podSpec)
+		// 	framework.ExpectNoError(err)
+
+		// 	gomega.Eventually(ctx, func(ctx context.Context) error {
+		// 		pod, err := getPodFromStandaloneKubelet(ctx, upgradedNs, staticPodName)
+		// 		if err != nil {
+		// 			return fmt.Errorf("error getting pod(%v/%v) from standalone kubelet: %w", upgradedNs, staticPodName, err)
+		// 		}
+
+		// 		isReady, err := testutils.PodRunningReady(pod)
+		// 		if err != nil {
+		// 			return fmt.Errorf("error checking if pod (%v/%v) is running ready: %w", upgradedNs, staticPodName, err)
+		// 		}
+		// 		if !isReady {
+		// 			return fmt.Errorf("pod (%v/%v) is not running", upgradedNs, staticPodName)
+		// 		}
+		// 		return nil
+		// 	}, f.Timeouts.PodStart, time.Second*5).Should(gomega.BeNil())
+		// })
 
 		ginkgo.AfterEach(func(ctx context.Context) {
 			ginkgo.By(fmt.Sprintf("delete the static pod (%v/%v)", ns, staticPodName))
@@ -88,12 +207,12 @@ var _ = SIGDescribe("[Feature:StandaloneMode] ", func() {
 					return nil
 				}
 				return fmt.Errorf("pod (%v/%v) still exists", ns, staticPodName)
-			})
+			}).Should(gomega.Succeed())
 		})
 	})
 })
 
-func createBasicStaticPod(dir, name, namespace string) error {
+func createBasicStaticPodSpec(name, namespace string) *v1.Pod {
 	podSpec := &v1.Pod{
 		TypeMeta: metav1.TypeMeta{
 			Kind:       "Pod",
@@ -134,6 +253,10 @@ func createBasicStaticPod(dir, name, namespace string) error {
 		},
 	}
 
+	return podSpec
+}
+
+func scheduleStaticPod(dir, name, namespace string, podSpec *v1.Pod) error {
 	file := staticPodPath(dir, name, namespace)
 	f, err := os.OpenFile(file, os.O_RDWR|os.O_TRUNC|os.O_CREATE, 0666)
 	if err != nil {

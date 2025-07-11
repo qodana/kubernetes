@@ -20,6 +20,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
 	testutil "k8s.io/kubernetes/test/integration/util"
@@ -28,9 +29,7 @@ import (
 // TestDefaultBinder tests the binding process in the scheduler.
 func TestDefaultBinder(t *testing.T) {
 	testCtx := testutil.InitTestSchedulerWithOptions(t, testutil.InitTestAPIServer(t, "", nil), 0)
-	testutil.SyncInformerFactory(testCtx)
-	// Do not start scheduler routine.
-	defer testutil.CleanupTest(t, testCtx)
+	testutil.SyncSchedulerInformerFactory(testCtx)
 
 	// Add a node.
 	node, err := testutil.CreateNode(testCtx.ClientSet, st.MakeNode().Name("testnode").Obj())
@@ -40,14 +39,14 @@ func TestDefaultBinder(t *testing.T) {
 
 	tests := map[string]struct {
 		anotherUID     bool
-		wantStatusCode framework.Code
+		wantStatusCode fwk.Code
 	}{
 		"same UID": {
-			wantStatusCode: framework.Success,
+			wantStatusCode: fwk.Success,
 		},
 		"different UID": {
 			anotherUID:     true,
-			wantStatusCode: framework.Error,
+			wantStatusCode: fwk.Error,
 		},
 	}
 	for name, tc := range tests {
@@ -56,14 +55,14 @@ func TestDefaultBinder(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Failed to create pod: %v", err)
 			}
-			defer testutil.CleanupPods(testCtx.ClientSet, t, []*corev1.Pod{pod})
+			defer testutil.CleanupPods(testCtx.Ctx, testCtx.ClientSet, t, []*corev1.Pod{pod})
 
 			podCopy := pod.DeepCopy()
 			if tc.anotherUID {
 				podCopy.UID = "another"
 			}
 
-			status := testCtx.Scheduler.Profiles["default-scheduler"].RunBindPlugins(testCtx.Ctx, nil, podCopy, node.Name)
+			status := testCtx.Scheduler.Profiles["default-scheduler"].RunBindPlugins(testCtx.Ctx, framework.NewCycleState(), podCopy, node.Name)
 			if code := status.Code(); code != tc.wantStatusCode {
 				t.Errorf("Bind returned code %s, want %s", code, tc.wantStatusCode)
 			}

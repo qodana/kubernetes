@@ -18,9 +18,10 @@ package hostpath
 
 import (
 	"fmt"
-	"k8s.io/klog/v2"
 	"os"
 	"regexp"
+
+	"k8s.io/klog/v2"
 
 	"github.com/opencontainers/selinux/go-selinux"
 
@@ -107,10 +108,6 @@ func (plugin *hostPathPlugin) SupportsMountOption() bool {
 	return false
 }
 
-func (plugin *hostPathPlugin) SupportsBulkVolumeVerification() bool {
-	return false
-}
-
 func (plugin *hostPathPlugin) SupportsSELinuxContextMount(spec *volume.Spec) (bool, error) {
 	return false, nil
 }
@@ -121,7 +118,7 @@ func (plugin *hostPathPlugin) GetAccessModes() []v1.PersistentVolumeAccessMode {
 	}
 }
 
-func (plugin *hostPathPlugin) NewMounter(spec *volume.Spec, pod *v1.Pod, opts volume.VolumeOptions) (volume.Mounter, error) {
+func (plugin *hostPathPlugin) NewMounter(spec *volume.Spec, pod *v1.Pod) (volume.Mounter, error) {
 	hostPathVolumeSource, readOnly, err := getVolumeSource(spec)
 	if err != nil {
 		return nil, err
@@ -141,7 +138,7 @@ func (plugin *hostPathPlugin) NewMounter(spec *volume.Spec, pod *v1.Pod, opts vo
 	return &hostPathMounter{
 		hostPath:      &hostPath{path: path, pathType: pathType},
 		readOnly:      readOnly,
-		mounter:       plugin.host.GetMounter(plugin.GetPluginName()),
+		mounter:       plugin.host.GetMounter(),
 		hu:            kvh.GetHostUtil(),
 		noTypeChecker: plugin.noTypeChecker,
 	}, nil

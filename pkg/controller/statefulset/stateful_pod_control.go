@@ -22,7 +22,7 @@ import (
 	"strings"
 
 	apps "k8s.io/api/apps/v1"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	errorutils "k8s.io/apimachinery/pkg/util/errors"
@@ -208,6 +208,7 @@ func (spc *StatefulPodControl) DeleteStatefulPod(set *apps.StatefulSet, pod *v1.
 // An error is returned if something is not consistent. This is expected if the pod is being otherwise updated,
 // but a problem otherwise (see usage of this method in UpdateStatefulPod).
 func (spc *StatefulPodControl) ClaimsMatchRetentionPolicy(ctx context.Context, set *apps.StatefulSet, pod *v1.Pod) (bool, error) {
+	logger := klog.FromContext(ctx)
 	ordinal := getOrdinal(pod)
 	templates := set.Spec.VolumeClaimTemplates
 	for i := range templates {
@@ -219,7 +220,7 @@ func (spc *StatefulPodControl) ClaimsMatchRetentionPolicy(ctx context.Context, s
 		case err != nil:
 			return false, fmt.Errorf("Could not retrieve claim %s for %s when checking PVC deletion policy", claimName, pod.Name)
 		default:
-			if !claimOwnerMatchesSetAndPod(claim, set, pod) {
+			if !isClaimOwnerUpToDate(logger, claim, set, pod) {
 				return false, nil
 			}
 		}
@@ -241,14 +242,16 @@ func (spc *StatefulPodControl) UpdatePodClaimForRetentionPolicy(ctx context.Cont
 		case err != nil:
 			return fmt.Errorf("Could not retrieve claim %s not found for %s when checking PVC deletion policy: %w", claimName, pod.Name, err)
 		default:
-			if !claimOwnerMatchesSetAndPod(claim, set, pod) {
+			if hasUnexpectedController(claim, set, pod) {
+				// Add an event so the user knows they're in a strange configuration. The claim will be cleaned up below.
+				msg := fmt.Sprintf("PersistentVolumeClaim %s has a conflicting OwnerReference that acts as a manging controller, the retention policy is ignored for this claim", claimName)
+				spc.recorder.Event(set, v1.EventTypeWarning, "ConflictingController", msg)
+			}
+			if !isClaimOwnerUpToDate(logger, claim, set, pod) {
 				claim = claim.DeepCopy() // Make a copy so we don't mutate the shared cache.
-				needsUpdate := updateClaimOwnerRefForSetAndPod(claim, set, pod)
-				if needsUpdate {
-					err := spc.objectMgr.UpdateClaim(claim)
-					if err != nil {
-						return fmt.Errorf("Could not update claim %s for delete policy ownerRefs: %w", claimName, err)
-					}
+				updateClaimOwnerRefForSetAndPod(logger, claim, set, pod)
+				if err := spc.objectMgr.UpdateClaim(claim); err != nil {
+					return fmt.Errorf("could not update claim %s for delete policy ownerRefs: %w", claimName, err)
 				}
 			}
 		}
@@ -274,8 +277,7 @@ func (spc *StatefulPodControl) PodClaimIsStale(set *apps.StatefulSet, pod *v1.Po
 		case err != nil:
 			return false, err
 		case err == nil:
-			// A claim is stale if it doesn't match the pod's UID, including if the pod has no UID.
-			if hasStaleOwnerRef(pvc, pod) {
+			if hasStaleOwnerRef(pvc, pod, podKind) {
 				return true, nil
 			}
 		}

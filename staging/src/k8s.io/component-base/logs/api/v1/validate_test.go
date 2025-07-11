@@ -31,9 +31,11 @@ func TestValidation(t *testing.T) {
 		Format: "text",
 		Options: FormatOptions{
 			JSON: JSONOptions{
-				SplitStream: true,
-				InfoBufferSize: resource.QuantityValue{
-					Quantity: *resource.NewQuantity(1024, resource.DecimalSI),
+				OutputRoutingOptions: OutputRoutingOptions{
+					SplitStream: true,
+					InfoBufferSize: resource.QuantityValue{
+						Quantity: *resource.NewQuantity(1024, resource.DecimalSI),
+					},
 				},
 			},
 		},
@@ -75,7 +77,7 @@ func TestValidation(t *testing.T) {
 				Format:    "text",
 				Verbosity: math.MaxInt32 + 1,
 			},
-			expectErrors: `verbosity: Invalid value: 0x80000000: Must be <= 2147483647`,
+			expectErrors: `verbosity: Invalid value: 2147483648: Must be <= 2147483647`,
 		},
 		"vmodule-verbosity-overflow": {
 			config: LoggingConfiguration{
@@ -87,7 +89,7 @@ func TestValidation(t *testing.T) {
 					},
 				},
 			},
-			expectErrors: `vmodule[0]: Invalid value: 0x80000000: Must be <= 2147483647`,
+			expectErrors: `vmodule[0]: Invalid value: 2147483648: Must be <= 2147483647`,
 		},
 		"vmodule-empty-pattern": {
 			config: LoggingConfiguration{
